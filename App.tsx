@@ -1,11 +1,11 @@
 import { View, Text, StyleSheet, TextInput } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
-import HomeScreen from './src/screens/HomeScreen';
+import { AudioTest } from './src/components/AudioTest';
 
 export default function App(){
   return (
-    <SafeAreaProvider>
-      <HomeScreen/>
-    </SafeAreaProvider>
+    <SafeAreaView style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+      <AudioTest/>
+    </SafeAreaView>
   )
 }

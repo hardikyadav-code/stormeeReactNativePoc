@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { StormeeClientRN } from "./ StormeeClient"
+import StormeeServiceRN from "./StormeeServiceRN";
 
 export function useStormeeRN(visible: boolean) {
   const [transcription, setTranscription] = useState("");
@@ -65,9 +66,12 @@ export function useStormeeRN(visible: boolean) {
     await clientRef.current.startStreaming(text);
   };
 
+
+
   return {
     transcription,
     connected,
     send,
+    // playAudio
   };
 }

@@ -9,6 +9,7 @@ import {
   StyleSheet,
 } from "react-native";
 import { useStormeeRN } from "../services/stormee/useStormeeRN";
+import StormeeServiceRN from "../services/stormee/StormeeServiceRN";
 
 type StormeeModalProps = {
   visible: boolean;
@@ -16,7 +17,8 @@ type StormeeModalProps = {
 };
 
 const StormeeModal = ({ visible, onClose }: StormeeModalProps) => {
-  const { transcription, connected, send } = useStormeeRN(visible);
+  const { transcription, connected, send  } = useStormeeRN(visible);
+  
 
   return (
     <Modal visible={visible} animationType="slide" presentationStyle="pageSheet">
@@ -50,6 +52,9 @@ const StormeeModal = ({ visible, onClose }: StormeeModalProps) => {
             </Text>
           </View>
         </View>
+        <Pressable style={styles.sendBtn}>
+  <Text style={styles.sendBtnText}>▶ Play Chunks</Text>
+</Pressable>
 
         {/* FOOTER */}
         <View style={styles.footer}>

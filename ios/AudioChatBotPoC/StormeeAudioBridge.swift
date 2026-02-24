@@ -1,334 +1,311 @@
-// StormeeAudioModule.swift - WITH BETTER WAV FILE DETECTION
+// StormeeAudioModule.swift
+// Fix for distorted/fast audio:
+// - Hardware audio runs at 44100Hz or 48000Hz
+// - Opus packets are 24000Hz
+// - We decode Opus→PCM at 24kHz, then use a SECOND AVAudioConverter
+//   to resample from 24kHz → hardware rate before scheduling
+// - This ensures the player node plays at the correct speed
 
 import Foundation
 import AVFoundation
-import AudioToolbox
 import React
 
 @objc(StormeeAudioModule)
 class StormeeAudioModule: NSObject {
 
-    private var audioEngine: AVAudioEngine?
-    private var playerNode: AVAudioPlayerNode?
-    private var converter: AudioConverterRef?
-    private var format: AVAudioFormat?
-    private var audioFile: AVAudioFile?
+    private var engine:        AVAudioEngine?
+    private var playerNode:    AVAudioPlayerNode?
+    private var opusConverter: AVAudioConverter?   // Opus compressed → PCM 24kHz
+    private var resampleConv:  AVAudioConverter?   // PCM 24kHz → PCM hardware rate
+
+    // Opus always comes in at 24kHz mono
+    private let opusPCMFormat = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: 24000,
+        channels: 1,
+        interleaved: false
+    )!
+
+    // Hardware output format — set after engine starts
+    private var hardwareFormat: AVAudioFormat?
+
+    // MARK: - Initialize
 
     @objc
     func initialize(_ resolve: @escaping RCTPromiseResolveBlock,
                     rejecter reject: @escaping RCTPromiseRejectBlock) {
-
         do {
-            let audioSession = AVAudioSession.sharedInstance()
-            try audioSession.setCategory(.playback, mode: .default, options: [.duckOthers])
-            try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
-            
-            print("✅ Audio session configured for playback")
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .default, options: [])
+            // Prefer 24kHz — if the hardware supports it we avoid resampling entirely
+            try? session.setPreferredSampleRate(24000)
+            try session.setActive(true)
 
-            audioEngine = AVAudioEngine()
-            playerNode = AVAudioPlayerNode()
+            let actualRate = session.sampleRate
+            print("✅ AVAudioSession ready | hardware rate: \(actualRate)Hz")
 
-            guard let engine = audioEngine,
-                  let player = playerNode else {
-                reject("INIT_ERROR", "Engine init failed", nil)
-                return
-            }
+            // Build engine
+            let eng    = AVAudioEngine()
+            let player = AVAudioPlayerNode()
+            eng.attach(player)
 
-            engine.attach(player)
+            // Get the hardware output format AFTER attaching to engine
+            // mainMixerNode.outputFormat reflects the actual hardware rate
+            let mainMixer    = eng.mainMixerNode
+            let hwOutputFmt  = mainMixer.outputFormat(forBus: 0)
+            let hwRate       = hwOutputFmt.sampleRate
+            print("📊 Hardware mixer rate: \(hwRate)Hz")
 
-            format = AVAudioFormat(
+            // The format we'll use for scheduling buffers to the player
+            // must match what we feed into playerNode
+            // Connect player -> mainMixer using hardware rate so no implicit conversion needed
+            let scheduleFormat = AVAudioFormat(
                 commonFormat: .pcmFormatFloat32,
-                sampleRate: 24000,
+                sampleRate: hwRate,
                 channels: 1,
                 interleaved: false
-            )
+            )!
+            eng.connect(player, to: mainMixer, format: scheduleFormat)
 
-            engine.connect(player, to: engine.mainMixerNode, format: format)
-            try engine.start()
-            
-            print("✅ Audio engine started")
-            print("📊 Audio format: \(String(describing: format))")
-            setupOpusConverter()
+            try eng.start()
+            print("✅ AVAudioEngine started | schedule format: \(scheduleFormat)")
+
+            self.engine        = eng
+            self.playerNode    = player
+            self.hardwareFormat = scheduleFormat
+
+            // ── Opus → PCM 24kHz converter ─────────────────────────────────────
+            var opusDesc = AudioStreamBasicDescription()
+            opusDesc.mSampleRate       = 24000
+            opusDesc.mFormatID         = kAudioFormatOpus
+            opusDesc.mChannelsPerFrame = 1
+
+            guard let opusFmt = AVAudioFormat(streamDescription: &opusDesc) else {
+                reject("INIT_ERROR", "Cannot create Opus AVAudioFormat", nil); return
+            }
+
+            guard let opusConv = AVAudioConverter(from: opusFmt, to: opusPCMFormat) else {
+                reject("INIT_ERROR",
+                       "AVAudioConverter(Opus→PCM) failed. iOS 15+ required.", nil)
+                return
+            }
+            self.opusConverter = opusConv
+            print("✅ Opus→PCM24k converter ready")
+
+            // ── PCM 24kHz → hardware rate resampler (skip if rates match) ──────
+            if hwRate != 24000 {
+                guard let resamp = AVAudioConverter(from: opusPCMFormat, to: scheduleFormat) else {
+                    reject("INIT_ERROR", "AVAudioConverter(24k→\(hwRate)) failed", nil); return
+                }
+                self.resampleConv = resamp
+                print("✅ Resampler 24kHz → \(hwRate)Hz ready")
+            } else {
+                self.resampleConv = nil
+                print("✅ Hardware is 24kHz — no resampling needed")
+            }
+
             resolve("initialized")
 
         } catch {
-            print("❌ Initialization error: \(error)")
-            reject("ENGINE_ERROR", "Audio engine failed: \(error.localizedDescription)", error)
+            reject("INIT_ERROR", error.localizedDescription, error)
         }
     }
 
-    private func setupOpusConverter() {
-        var inputFormat = AudioStreamBasicDescription()
-        inputFormat.mSampleRate = 24000
-        inputFormat.mFormatID = kAudioFormatOpus
-        inputFormat.mChannelsPerFrame = 1
-        inputFormat.mFramesPerPacket = 0
-
-        var outputFormatDesc = AudioStreamBasicDescription()
-        outputFormatDesc.mSampleRate = 24000
-        outputFormatDesc.mFormatID = kAudioFormatLinearPCM
-        outputFormatDesc.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
-        outputFormatDesc.mBitsPerChannel = 32
-        outputFormatDesc.mChannelsPerFrame = 1
-        outputFormatDesc.mFramesPerPacket = 1
-        outputFormatDesc.mBytesPerFrame = 4
-        outputFormatDesc.mBytesPerPacket = 4
-
-        let status = AudioConverterNew(&inputFormat, &outputFormatDesc, &converter)
-        if status != noErr {
-            print("❌ Failed to create Opus converter:", status)
-        } else {
-            print("✅ Opus converter ready")
-        }
-    }
-
-    // ✅ UPDATED: Better WAV file detection
-    @objc
-    func playWAVFile(_ resolve: @escaping RCTPromiseResolveBlock,
-                     rejecter reject: @escaping RCTPromiseRejectBlock) {
-        
-        print("🎵 [TEST] Attempting to play WAV file from bundle...")
-        
-        guard let engine = audioEngine,
-              let playerNode = playerNode else {
-            reject("ERROR", "Engine not ready", nil)
-            return
-        }
-        
-        do {
-            // Try to find WAV file - list common names
-            var wavURL: URL?
-            
-            // Try common names first
-            let possibleNames = [
-                "test",  // Most likely after renaming
-                "audio",
-                "sample",
-                "693ff8790dec6629c2d92da4__online-video-cutter_com___1_"  // Original filename
-            ]
-            
-            for name in possibleNames {
-                if let url = Bundle.main.url(forResource: name, withExtension: "wav") {
-                    wavURL = url
-                    print("✅ Found WAV file: \(name).wav")
-                    break
-                }
-            }
-            
-            // If still not found, list what's actually in the bundle
-            guard let wavURL = wavURL else {
-                print("❌ WAV file not found in bundle!")
-                print("📂 Checking bundle contents...")
-                
-                if let resourcePath = Bundle.main.resourcePath {
-                    let fileManager = FileManager.default
-                    do {
-                        let contents = try fileManager.contentsOfDirectory(atPath: resourcePath)
-                        let wavFiles = contents.filter { $0.lowercased().hasSuffix(".wav") }
-                        print("Found WAV files in bundle: \(wavFiles)")
-                        
-                        if wavFiles.isEmpty {
-                            print("⚠️ No WAV files found! Please add a .wav file to Xcode:")
-                            print("   1. Right-click project in Xcode")
-                            print("   2. Select 'Add Files to AudioChatBotPoC'")
-                            print("   3. Select your WAV file")
-                            print("   4. Check 'Copy items if needed'")
-                            print("   5. Check 'AudioChatBotPoC' target")
-                            print("   6. Click 'Add'")
-                        }
-                    } catch {
-                        print("Error reading bundle: \(error)")
-                    }
-                }
-                
-                reject("FILE_NOT_FOUND", "No WAV file found in bundle. Check Xcode console for instructions.", nil)
-                return
-            }
-            
-            print("📂 Found WAV file at: \(wavURL)")
-            
-            // Load WAV file
-            let audioFile = try AVAudioFile(forReading: wavURL)
-            self.audioFile = audioFile
-            
-            print("📊 WAV File loaded:")
-            print("   Format: \(audioFile.processingFormat)")
-            print("   Sample rate: \(audioFile.processingFormat.sampleRate)")
-            print("   Channels: \(audioFile.processingFormat.channelCount)")
-            print("   Length: \(audioFile.length) frames")
-            
-            // Make sure engine is running
-            if !engine.isRunning {
-                try engine.start()
-                print("✅ Engine restarted")
-            }
-            
-            // Start playback
-            try playerNode.play()
-            print("▶️ Player started")
-            
-            // Schedule entire file for playback
-            try playerNode.scheduleFile(audioFile, at: nil)
-            
-            print("✅ WAV file scheduled for playback")
-            print("▶️ Now playing: \(wavURL.lastPathComponent)")
-            print("🔊 Listen to your simulator speaker!")
-            
-            resolve("playing")
-            
-        } catch {
-            print("❌ Error playing WAV file: \(error)")
-            reject("PLAY_ERROR", "Failed to play WAV: \(error.localizedDescription)", error)
-        }
-    }
+    // MARK: - Write Audio Frame
 
     @objc
     func writeAudioFrame(_ base64Data: String,
-                        resolver resolve: @escaping RCTPromiseResolveBlock,
-                        rejecter reject: @escaping RCTPromiseRejectBlock) {
+                         resolver resolve: @escaping RCTPromiseResolveBlock,
+                         rejecter reject: @escaping RCTPromiseRejectBlock) {
 
-        guard let opusFrameData = Data(base64Encoded: base64Data) else {
-            reject("DECODE_ERROR", "Invalid base64", nil)
-            return
+        guard let opusData = Data(base64Encoded: base64Data), opusData.count > 0 else {
+            resolve("skipped-empty"); return
         }
 
-        guard let converter = converter,
-              let playerNode = playerNode,
-              let format = format,
-              let engine = audioEngine else {
-            reject("DECODE_ERROR", "Invalid state", nil)
-            return
+        let hex = opusData.prefix(6).map { String(format: "%02x", $0) }.joined(separator: " ")
+        print("🎵 writeAudioFrame: \(opusData.count)B | [\(hex)]")
+
+        guard let opusConv   = opusConverter,
+              let hwFmt      = hardwareFormat,
+              let engine     = engine,
+              let player     = playerNode else {
+            reject("STATE_ERROR", "Not initialized", nil); return
+        }
+
+        DispatchQueue.global(qos: .userInteractive).async {
+            do {
+                // Step 1: Decode Opus → PCM at 24kHz
+                let pcm24k = try self.decodeOpus(opusData, converter: opusConv)
+                print("   Decoded: \(pcm24k.frameLength) frames @ 24kHz")
+
+                // Step 2: Resample to hardware rate if needed
+                let finalBuffer: AVAudioPCMBuffer
+                if let resamp = self.resampleConv {
+                    finalBuffer = try self.resample(pcm24k, to: hwFmt, converter: resamp)
+                    print("   Resampled: \(finalBuffer.frameLength) frames @ \(hwFmt.sampleRate)Hz")
+                } else {
+                    finalBuffer = pcm24k
+                }
+
+                // Step 3: Schedule for playback
+                try self.schedule(finalBuffer, player: player, engine: engine)
+                resolve("played")
+
+            } catch {
+                print("❌ \(error.localizedDescription)")
+                reject("AUDIO_ERROR", error.localizedDescription, error)
+            }
+        }
+    }
+
+    // MARK: - Decode Opus → PCM 24kHz
+
+    private func decodeOpus(_ opusData: Data,
+                             converter: AVAudioConverter) throws -> AVAudioPCMBuffer {
+
+        // Wrap Opus in AVAudioCompressedBuffer
+        let compBuf = AVAudioCompressedBuffer(
+            format: converter.inputFormat,
+            packetCapacity: 1,
+            maximumPacketSize: max(opusData.count, 4096)
+        )
+
+        opusData.withUnsafeBytes { ptr in
+            guard let src = ptr.baseAddress else { return }
+            compBuf.data.copyMemory(from: src, byteCount: opusData.count)
+        }
+        compBuf.byteLength  = UInt32(opusData.count)
+        compBuf.packetCount = 1
+
+        if let descs = compBuf.packetDescriptions {
+            descs[0].mStartOffset            = 0
+            descs[0].mDataByteSize           = UInt32(opusData.count)
+            descs[0].mVariableFramesInPacket = 0
+        }
+
+        // Output PCM buffer — 960 frames = 40ms at 24kHz (safe upper bound)
+        guard let pcmBuf = AVAudioPCMBuffer(pcmFormat: converter.outputFormat,
+                                             frameCapacity: 960) else {
+            throw AudioErr.bufferFailed("output PCM 24kHz")
+        }
+
+        var inputConsumed = false
+        var convError: NSError?
+
+        let status = converter.convert(to: pcmBuf, error: &convError) { _, outStatus in
+            if inputConsumed { outStatus.pointee = .noDataNow; return nil }
+            inputConsumed = true
+            outStatus.pointee = .haveData
+            return compBuf
+        }
+
+        if let err = convError { throw AudioErr.converterFailed(err.localizedDescription) }
+        guard status != .error else { throw AudioErr.converterFailed("Opus decoder returned .error") }
+        guard pcmBuf.frameLength > 0 else { throw AudioErr.emptyResult }
+
+        return pcmBuf
+    }
+
+    // MARK: - Resample PCM 24kHz → hardware rate
+
+    private func resample(_ input: AVAudioPCMBuffer,
+                           to outFmt: AVAudioFormat,
+                           converter: AVAudioConverter) throws -> AVAudioPCMBuffer {
+
+        // Calculate output frame count based on ratio
+        let ratio      = outFmt.sampleRate / input.format.sampleRate
+        let outFrames  = AVAudioFrameCount(Double(input.frameLength) * ratio) + 64 // +64 headroom
+
+        guard let outBuf = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: outFrames) else {
+            throw AudioErr.bufferFailed("resample output")
+        }
+
+        var inputConsumed = false
+        var convError: NSError?
+
+        let status = converter.convert(to: outBuf, error: &convError) { _, outStatus in
+            if inputConsumed { outStatus.pointee = .noDataNow; return nil }
+            inputConsumed = true
+            outStatus.pointee = .haveData
+            return input
+        }
+
+        if let err = convError { throw AudioErr.converterFailed("Resample: \(err.localizedDescription)") }
+        guard status != .error else { throw AudioErr.converterFailed("Resampler returned .error") }
+        guard outBuf.frameLength > 0 else { throw AudioErr.emptyResult }
+
+        return outBuf
+    }
+
+    // MARK: - Schedule buffer for playback
+
+    private func schedule(_ buf: AVAudioPCMBuffer,
+                           player: AVAudioPlayerNode,
+                           engine: AVAudioEngine) throws {
+        if !engine.isRunning { try engine.start(); print("🔄 Engine restarted") }
+
+        player.scheduleBuffer(buf, completionHandler: nil)
+
+        if !player.isPlaying {
+            player.play()
+            print("▶️ Playback started")
+        }
+        print("📅 Scheduled \(buf.frameLength) frames @ \(buf.format.sampleRate)Hz")
+    }
+
+    // MARK: - WAV Test
+
+    @objc
+    func playWAVFile(_ resolve: @escaping RCTPromiseResolveBlock,
+                     rejecter reject: @escaping RCTPromiseRejectBlock) {
+
+        guard let engine = engine, let player = playerNode else {
+            reject("ERROR", "Not initialized", nil); return
+        }
+
+        let names = ["test", "audio", "sample",
+                     "693ff8790dec6629c2d92da4__online-video-cutter_com___1_"]
+        guard let url = names.lazy.compactMap({
+            Bundle.main.url(forResource: $0, withExtension: "wav")
+        }).first else {
+            reject("NOT_FOUND", "No WAV in bundle", nil); return
         }
 
         do {
-            let (pcmData, decodedBytes) = try decodeOpusFrame(opusFrameData, converter: converter)
-
-            if decodedBytes == 0 {
-                print("⏭️ No audio decoded")
-                resolve("skipped")
-                return
-            }
-
-            let frameCount = decodedBytes / 4
-
-            guard frameCount > 0 else {
-                print("⏭️ Invalid frame count: \(frameCount)")
-                resolve("skipped")
-                return
-            }
-
-            guard let pcmBuffer = AVAudioPCMBuffer(
-                pcmFormat: format,
-                frameCapacity: AVAudioFrameCount(frameCount)
-            ) else {
-                reject("BUFFER_ERROR", "Buffer creation failed", nil)
-                return
-            }
-
-            pcmBuffer.frameLength = AVAudioFrameCount(frameCount)
-
-            let dataToUse = pcmData.prefix(Int(decodedBytes))
-            dataToUse.withUnsafeBytes { rawPtr in
-                if let baseAddress = rawPtr.baseAddress {
-                    memcpy(pcmBuffer.floatChannelData![0],
-                           baseAddress,
-                           Int(decodedBytes))
-                }
-            }
-
-            if engine.isRunning == false {
-                try engine.start()
-            }
-
-            playerNode.scheduleBuffer(pcmBuffer, completionHandler: nil)
-
-            if !playerNode.isPlaying {
-                try playerNode.play()
-                print("▶️ Audio playback started")
-            }
-
-            print("🎵 Scheduled audio buffer: \(frameCount) frames (\(decodedBytes) bytes)")
-            resolve("played")
-
+            let file = try AVAudioFile(forReading: url)
+            if !engine.isRunning { try engine.start() }
+            player.scheduleFile(file, at: nil)
+            if !player.isPlaying { player.play() }
+            print("▶️ WAV: \(url.lastPathComponent)")
+            resolve("playing")
         } catch {
-            print("❌ Error: \(error)")
-            reject("DECODE_ERROR", "Opus decode failed", error)
+            reject("PLAY_ERROR", error.localizedDescription, error)
         }
     }
 
-    private func decodeOpusFrame(_ opusData: Data, converter: AudioConverterRef) throws -> (Data, UInt32) {
-        let maxOutputFrames: UInt32 = 5760
-        let maxOutputBytes = maxOutputFrames * 4
-
-        var outputBuffer = Data(count: Int(maxOutputBytes))
-        var decodedByteSize: UInt32 = 0
-
-        let status = opusData.withUnsafeBytes { (inputPtr: UnsafeRawBufferPointer) -> OSStatus in
-            return outputBuffer.withUnsafeMutableBytes { (outputPtr: UnsafeMutableRawBufferPointer) -> OSStatus in
-
-                guard let inputBase = inputPtr.baseAddress else {
-                    return -1
-                }
-                guard let outputBase = outputPtr.baseAddress else {
-                    return -1
-                }
-
-                var inputBufferList = AudioBufferList(
-                    mNumberBuffers: 1,
-                    mBuffers: AudioBuffer(
-                        mNumberChannels: 1,
-                        mDataByteSize: UInt32(opusData.count),
-                        mData: UnsafeMutableRawPointer(mutating: inputBase)
-                    )
-                )
-
-                var outputBufferList = AudioBufferList(
-                    mNumberBuffers: 1,
-                    mBuffers: AudioBuffer(
-                        mNumberChannels: 1,
-                        mDataByteSize: UInt32(maxOutputBytes),
-                        mData: outputBase
-                    )
-                )
-
-                var numberInputPackets: UInt32 = 1
-
-                let status = AudioConverterConvertComplexBuffer(
-                    converter,
-                    numberInputPackets,
-                    &inputBufferList,
-                    &outputBufferList
-                )
-
-                decodedByteSize = outputBufferList.mBuffers.mDataByteSize
-                
-                if status == noErr && decodedByteSize > 0 {
-                    print("✅ Decoded \(decodedByteSize) bytes from Opus")
-                }
-
-                return status
-            }
-        }
-
-        if status != noErr {
-            print("❌ Opus decode failed: \(status)")
-            throw NSError(domain: "AudioConverter", code: Int(status), userInfo: nil)
-        }
-
-        return (outputBuffer, decodedByteSize)
-    }
+    // MARK: - Stop
 
     @objc
     func stop(_ resolve: @escaping RCTPromiseResolveBlock,
               rejecter reject: @escaping RCTPromiseRejectBlock) {
+        playerNode?.stop()
+        print("⏹️ Stopped")
+        resolve("stopped")
+    }
+}
 
-        do {
-            playerNode?.stop()
-            try audioEngine?.stop()
-            print("⏹️ Audio stopped")
-            resolve("stopped")
-        } catch {
-            reject("STOP_ERROR", "Stop failed", error)
+// MARK: - Errors
+
+enum AudioErr: Error, LocalizedError {
+    case bufferFailed(_ name: String)
+    case converterFailed(_ msg: String)
+    case emptyResult
+
+    var errorDescription: String? {
+        switch self {
+        case .bufferFailed(let n):    return "Buffer creation failed: \(n)"
+        case .converterFailed(let m): return "Converter failed: \(m)"
+        case .emptyResult:            return "0 frames decoded"
         }
     }
 }

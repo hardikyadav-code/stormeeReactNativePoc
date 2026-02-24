@@ -1,4 +1,4 @@
-// src/services/stormee/StormeeServiceRN.ts
+// StormeeServiceRN.ts
 
 import { Buffer } from "buffer";
 import { NativeModules } from "react-native";
@@ -8,448 +8,540 @@ import { NativeModules } from "react-native";
 const { StormeeAudioModule } = NativeModules;
 
 export enum StreamingState {
-  IDLE = "IDLE",
+  IDLE       = "IDLE",
   CONNECTING = "CONNECTING",
-  CONNECTED = "CONNECTED",
-  STREAM_STARTING = "STREAM_STARTING",
-  STREAMING = "STREAMING",
-  BUFFERING = "BUFFERING",
+  CONNECTED  = "CONNECTED",
+  STREAMING  = "STREAMING",
   RECONNECTING = "RECONNECTING",
-  ERROR = "ERROR",
+  ERROR      = "ERROR",
 }
 
 type EventHandlers = {
-  onConnect?: () => void;
-  onDisconnect?: () => void;
-  onTranscription?: (text: string, chunkNumber?: number) => void;
-  onAudioChunk?: (bytes: Uint8Array, chunkNumber?: number) => void;
-  onError?: (err: any) => void;
-  onStreamStart?: () => void;
-  onStreamEnd?: () => void;
-  onHeaderMessage?: (message: string) => void;
+  onConnect?:        () => void;
+  onDisconnect?:     () => void;
+  onTranscription?:  (text: string, chunkNumber?: number) => void;
+  onAudioChunk?:     (bytes: Uint8Array, chunkNumber?: number) => void;
+  onError?:          (err: any) => void;
+  onStreamStart?:    () => void;
+  onStreamEnd?:      () => void;
+  onHeaderMessage?:  (message: string) => void;
   onChunkProcessed?: (chunk: any) => void;
 };
 
-class StormeeServiceRN {
-  // WebSocket and state
-  private socket: WebSocket | null = null;
-  private state: StreamingState = StreamingState.IDLE;
-  private handlers: EventHandlers = {};
-  public isConnected = false;
+// ─────────────────────────────────────────────────────────────────────────────
+// WIRE FORMAT (from backend Python source):
+//
+//   token_id, binary_data = data
+//   combined = b'\x92' + msgpack.packb(token_id) + binary_data
+//
+// binary_data is itself a msgpack-encoded dict:
+//   {
+//     "chunk_number":   <int>,
+//     "transcription":  <str>,   ← TTS speech text
+//     "audio_data":     <bin>,   ← raw Opus packet
+//     "isEnd":          <bool>,
+//     "header_message": <str>,
+//     "custom_content": <any>,
+//   }
+//
+// Full parse result: [ token_id_str, { audio_data: Uint8Array, ... } ]
+//
+// HERMES NOTE:
+//   React Native's Hermes engine returns Uint8Array from buf.subarray() but
+//   Object.keys(Uint8Array) === [] — it does NOT enumerate array indices.
+//   The ONLY reliable extraction method is: v.length + v[i] index access.
+// ─────────────────────────────────────────────────────────────────────────────
 
-  // Reconnection logic
-  private reconnectAttempts = 0;
-  private maxReconnectAttempts = 5;
-  private reconnectDelay = 1000;
-  private pendingSessionId: string = "";
+// ── Hermes-safe binary extraction ────────────────────────────────────────────
+function extractBytes(v: unknown): Uint8Array | null {
+  if (v == null) return null;
 
-  // Stream management
-  private isUserStopped: boolean = false;
-  private lastRequest: any = null;
-  private lastRequestId: string = "";
-  private chunkCounter: number = 0;
-
-  // ✅ AUDIO BUFFERING
-  private audioBuffer: Uint8Array[] = [];
-  private totalAudioBytes: number = 0;
-  private bufferedChunkCount: number = 0;
-
-  // Hardcoded WebSocket base URL (session ID will be appended to path)
-  private readonly WS_BASE_URL = "wss://devllmstudio.creativeworkspace.ai/stormee-asgi-server/ws";
-
-  setEventHandlers(handlers: EventHandlers) {
-    this.handlers = handlers;
+  // Already a proper typed array
+  if (v instanceof Uint8Array) return v.length > 0 ? v : null;
+  if (ArrayBuffer.isView(v)) {
+    const b = v as ArrayBufferView;
+    return b.byteLength > 0 ? new Uint8Array(b.buffer, b.byteOffset, b.byteLength) : null;
   }
 
-  async initialize() {
-    console.log("🎵 Starting initialization...");
+  // Base64 string
+  if (typeof v === "string") {
+    if (!v.length) return null;
     try {
-      await StormeeAudioModule.initialize();
-      console.log("✅ Service initialized");
-    } catch (error) {
-      console.error("❌ Initialization failed:", error);
-      throw error;
+      const d = Buffer.from(v, "base64");
+      return d.length > 0 ? new Uint8Array(d) : null;
+    } catch { return null; }
+  }
+
+  if (typeof v === "object") {
+    // Array of numbers or array wrapping a typed array
+    if (Array.isArray(v)) {
+      if (!v.length) return null;
+      if (typeof v[0] === "number") return new Uint8Array(v as number[]);
+      // Array wrapping one binary value: [Uint8Array(N)]
+      for (const el of v) {
+        const inner = extractBytes(el);
+        if (inner) return inner;
+      }
+      return null;
+    }
+
+    // KEY FIX FOR HERMES:
+    // Object.keys(Uint8Array) returns [] in Hermes — useless.
+    // But .length and v[i] always work on any array-like object including Uint8Array.
+    const obj = v as any;
+    if (typeof obj.length === "number" && obj.length > 0) {
+      if (typeof obj[0] === "number") {
+        const bytes = new Uint8Array(obj.length);
+        for (let i = 0; i < obj.length; i++) bytes[i] = obj[i] ?? 0;
+        return bytes;
+      }
+      // length > 0 but first element isn't a number — try recursing on element 0
+      const inner = extractBytes(obj[0]);
+      if (inner) return inner;
+    }
+
+    // Last resort: plain object with numeric string keys {"0":104,"1":11,...}
+    const keys = Object.keys(obj).filter(k => !isNaN(Number(k)))
+                                  .sort((a, b) => Number(a) - Number(b));
+    if (keys.length > 0) {
+      const bytes = new Uint8Array(keys.length);
+      for (let i = 0; i < keys.length; i++) bytes[i] = obj[keys[i]] ?? 0;
+      return bytes;
     }
   }
 
-  getState(): StreamingState {
-    return this.state;
+  return null;
+}
+
+// ── Minimal msgpack parser ────────────────────────────────────────────────────
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type MsgVal = any;
+interface Parsed { value: MsgVal; offset: number; }
+
+function parseMsgpack(buf: Uint8Array, offset: number): Parsed {
+  if (offset >= buf.length) throw new Error(`msgpack offset ${offset} out of bounds`);
+  const t = buf[offset++];
+
+  if ((t & 0x80) === 0x00) return { value: t, offset };           // pos fixint
+  if ((t & 0xe0) === 0xe0) return { value: t - 256, offset };      // neg fixint
+
+  if ((t & 0xf0) === 0x80) {                                        // fixmap
+    const n = t & 0x0f;
+    const map: Record<string, MsgVal> = {};
+    for (let i = 0; i < n; i++) {
+      const k = parseMsgpack(buf, offset); offset = k.offset;
+      const v = parseMsgpack(buf, offset); offset = v.offset;
+      map[String(k.value)] = v.value;
+    }
+    return { value: map, offset };
   }
 
-  connect(sessionId: string, _wsUrl?: string) {
-    this.pendingSessionId = sessionId;
-    const finalUrl = `${this.WS_BASE_URL}/${sessionId}`;
+  if ((t & 0xf0) === 0x90) {                                        // fixarray
+    const n = t & 0x0f;
+    const arr: MsgVal[] = [];
+    for (let i = 0; i < n; i++) {
+      const v = parseMsgpack(buf, offset); offset = v.offset;
+      arr.push(v.value);
+    }
+    return { value: arr, offset };
+  }
 
-    console.log(`🔌 Connecting to ${this.WS_BASE_URL}...`);
-    console.log(`📋 Session ID: ${sessionId}`);
-    console.log(`📡 Final URL: ${finalUrl}`);
+  if ((t & 0xe0) === 0xa0) {                                        // fixstr
+    const n = t & 0x1f;
+    return { value: Buffer.from(buf.subarray(offset, offset + n)).toString("utf8"), offset: offset + n };
+  }
 
-    this.state = StreamingState.CONNECTING;
+  switch (t) {
+    case 0xc0: return { value: null,  offset };
+    case 0xc2: return { value: false, offset };
+    case 0xc3: return { value: true,  offset };
 
-    try {
+    case 0xc4: { const n = buf[offset++]; return { value: buf.subarray(offset, offset + n), offset: offset + n }; }
+    case 0xc5: { const n = (buf[offset] << 8) | buf[offset + 1]; offset += 2; return { value: buf.subarray(offset, offset + n), offset: offset + n }; }
+    case 0xc6: { const n = ((buf[offset]<<24)|(buf[offset+1]<<16)|(buf[offset+2]<<8)|buf[offset+3])>>>0; offset+=4; return { value: buf.subarray(offset, offset + n), offset: offset + n }; }
+
+    case 0xca: return { value: 0, offset: offset + 4 };
+    case 0xcb: return { value: 0, offset: offset + 8 };
+
+    case 0xcc: return { value: buf[offset], offset: offset + 1 };
+    case 0xcd: { const v = (buf[offset]<<8)|buf[offset+1]; return { value: v, offset: offset+2 }; }
+    case 0xce: { const v = ((buf[offset]<<24)|(buf[offset+1]<<16)|(buf[offset+2]<<8)|buf[offset+3])>>>0; return { value: v, offset: offset+4 }; }
+    case 0xd0: { const v = buf[offset]; return { value: v > 127 ? v - 256 : v, offset: offset+1 }; }
+    case 0xd1: { const v = (buf[offset]<<8)|buf[offset+1]; return { value: v > 32767 ? v - 65536 : v, offset: offset+2 }; }
+    case 0xd2: { const v = (buf[offset]<<24)|(buf[offset+1]<<16)|(buf[offset+2]<<8)|buf[offset+3]; return { value: v, offset: offset+4 }; }
+
+    case 0xd9: { const n = buf[offset++]; return { value: Buffer.from(buf.subarray(offset, offset+n)).toString("utf8"), offset: offset+n }; }
+    case 0xda: { const n = (buf[offset]<<8)|buf[offset+1]; offset+=2; return { value: Buffer.from(buf.subarray(offset, offset+n)).toString("utf8"), offset: offset+n }; }
+    case 0xdb: { const n = ((buf[offset]<<24)|(buf[offset+1]<<16)|(buf[offset+2]<<8)|buf[offset+3])>>>0; offset+=4; return { value: Buffer.from(buf.subarray(offset, offset+n)).toString("utf8"), offset: offset+n }; }
+
+    case 0xdc: { const n=(buf[offset]<<8)|buf[offset+1]; offset+=2; const arr:MsgVal[]=[]; for(let i=0;i<n;i++){const v=parseMsgpack(buf,offset);offset=v.offset;arr.push(v.value);} return {value:arr,offset}; }
+    case 0xde: { const n=(buf[offset]<<8)|buf[offset+1]; offset+=2; const m:Record<string,MsgVal>={}; for(let i=0;i<n;i++){const k=parseMsgpack(buf,offset);offset=k.offset;const v=parseMsgpack(buf,offset);offset=v.offset;m[String(k.value)]=v.value;} return {value:m,offset}; }
+    case 0xdf: { const n=((buf[offset]<<24)|(buf[offset+1]<<16)|(buf[offset+2]<<8)|buf[offset+3])>>>0;offset+=4; const m:Record<string,MsgVal>={}; for(let i=0;i<n;i++){const k=parseMsgpack(buf,offset);offset=k.offset;const v=parseMsgpack(buf,offset);offset=v.offset;m[String(k.value)]=v.value;} return {value:m,offset}; }
+
+    default: throw new Error(`Unknown msgpack type 0x${t.toString(16)} at offset ${offset-1}`);
+  }
+}
+
+// ── Parse one binary WebSocket frame ─────────────────────────────────────────
+interface ChunkResult {
+  tokenId:       string;
+  opusBytes:     Uint8Array | null;
+  transcription: string | null;
+  chunkNumber:   number | null;
+  isEnd:         boolean;
+  headerMessage: string | null;
+}
+
+function parseFrame(raw: Uint8Array): ChunkResult {
+  const result: ChunkResult = {
+    tokenId: "", opusBytes: null,
+    transcription: null, chunkNumber: null,
+    isEnd: false, headerMessage: null,
+  };
+
+  try {
+    // Parse the full frame as msgpack — gives [token_id, {audio_data, ...}]
+    const parsed = parseMsgpack(raw, 0);
+    const arr = parsed.value as MsgVal[];
+
+    if (!Array.isArray(arr) || arr.length < 2) {
+      console.warn("⚠️ Frame root not array(2)");
+      return result;
+    }
+
+    // ── Element 0: resumption token ───────────────────────────────────────
+    if (typeof arr[0] === "string") {
+      result.tokenId = arr[0];
+    } else {
+      const tb = extractBytes(arr[0]);
+      if (tb) result.tokenId = Buffer.from(tb).toString("utf8");
+    }
+
+    // ── Element 1: metadata dict ──────────────────────────────────────────
+    const meta = arr[1] as Record<string, MsgVal>;
+    if (typeof meta !== "object" || meta === null || Array.isArray(meta)) {
+      console.warn("⚠️ Element 1 not a dict");
+      return result;
+    }
+
+    console.log(`📦 token="${result.tokenId}" keys=[${Object.keys(meta).join(", ")}]`);
+
+    if (typeof meta["chunk_number"] === "number") result.chunkNumber = meta["chunk_number"] as number;
+    if (meta["isEnd"] === true)                   result.isEnd = true;
+
+    const hm = meta["header_message"];
+    if (typeof hm === "string" && hm.trim()) result.headerMessage = hm.trim();
+
+    const tx = meta["transcription"];
+    if (typeof tx === "string" && tx.trim()) result.transcription = tx.trim();
+
+    // ── audio_data → Opus bytes ───────────────────────────────────────────
+    const audioRaw = meta["audio_data"];
+    if (audioRaw == null) {
+      console.warn("⚠️ audio_data missing");
+      return result;
+    }
+
+    console.log(`🔍 audio_data typeof="${typeof audioRaw}" .length=${(audioRaw as any)?.length ?? "?"}`);
+
+    const bytes = extractBytes(audioRaw);
+    if (bytes && bytes.length > 0) {
+      result.opusBytes = bytes;
+      console.log(`✅ audio_data → ${bytes.length} Opus bytes | first=0x${bytes[0].toString(16)}`);
+    } else {
+      console.warn(`⚠️ extractBytes returned null — raw: ${JSON.stringify(audioRaw).slice(0, 120)}`);
+    }
+
+  } catch (err) {
+    console.error("❌ parseFrame error:", err);
+  }
+
+  return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SERVICE
+// ─────────────────────────────────────────────────────────────────────────────
+class StormeeServiceRN {
+  private socket:    WebSocket | null = null;
+  private state:     StreamingState   = StreamingState.IDLE;
+  private handlers:  EventHandlers    = {};
+  public  isConnected = false;
+
+  private reconnectAttempts   = 0;
+  private maxReconnectAttempts = 5;
+  private reconnectDelay       = 1000;
+  private pendingSessionId     = "";
+  private isUserStopped        = false;
+  private chunkCounter         = 0;
+
+  private connectResolve: (() => void)       | null = null;
+  private connectReject:  ((e: any) => void) | null = null;
+  private playbackQueue: Promise<void> = Promise.resolve();
+
+  private readonly WS_BASE_URL =
+    "wss://devllmstudio.creativeworkspace.ai/stormee-asgi-server/ws";
+
+  setEventHandlers(h: EventHandlers) { this.handlers = h; }
+
+  async initialize() {
+    console.log("🎵 Initializing...");
+    await StormeeAudioModule.initialize();
+    console.log("✅ Audio engine ready");
+  }
+
+  getState() { return this.state; }
+
+  // ── Connect ───────────────────────────────────────────────────────────────
+  connect(sessionId: string): Promise<void> {
+    if (this.isConnected && this.pendingSessionId === sessionId && this.socket) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+      this.pendingSessionId = sessionId;
+      console.log(`🔌 Connecting: ${this.WS_BASE_URL}/${sessionId}`);
+      this.state            = StreamingState.CONNECTING;
+      this.connectResolve   = resolve;
+      this.connectReject    = reject;
+      this.isUserStopped    = false;
+      this.reconnectAttempts = 0;
+      this.chunkCounter     = 0;
+      this.playbackQueue    = Promise.resolve();
+
       if (this.socket) {
+        this.socket.onopen = this.socket.onmessage =
+        this.socket.onerror = this.socket.onclose = null;
         this.socket.close();
         this.socket = null;
       }
 
-      this.socket = new WebSocket(finalUrl);
-      (this.socket as any).binaryType = "arraybuffer";
+      try {
+        const ws = new WebSocket(`${this.WS_BASE_URL}/${sessionId}`);
+        (ws as any).binaryType = "arraybuffer";
+        this.socket = ws;
 
-      this.socket.onopen = () => {
-        console.log("✅ WebSocket Connected");
-        this.isConnected = true;
-        this.state = StreamingState.CONNECTED;
-        this.reconnectAttempts = 0;
-        this.isUserStopped = false;
+        ws.onopen = () => {
+          console.log("✅ WebSocket open");
+          this.isConnected = true;
+          this.state       = StreamingState.CONNECTED;
+          this.reconnectAttempts = 0;
+          this.connectResolve?.();
+          this.connectResolve = this.connectReject = null;
+          this.handlers.onConnect?.();
+        };
 
-        // ✅ Reset audio buffer for new stream
-        this.audioBuffer = [];
-        this.totalAudioBytes = 0;
-        this.bufferedChunkCount = 0;
+        ws.onmessage = async (e: any) => { await this.handleMessage(e); };
 
-        if (this.handlers.onConnect) {
-          this.handlers.onConnect();
-        }
-      };
+        ws.onerror = (err: any) => {
+          console.error("🚨 WS error:", err);
+          this.state = StreamingState.ERROR;
+          this.connectReject?.(err);
+          this.connectResolve = this.connectReject = null;
+          this.handlers.onError?.(err);
+        };
 
-      this.socket.onmessage = async (event: any) => {
-        await this.handleMessage(event);
-      };
+        ws.onclose = (e: any) => {
+          console.log(`❌ WS closed code=${e.code}`);
+          this.isConnected = false;
+          this.connectReject?.(new Error(`WS closed before open (code=${e.code})`));
+          this.connectResolve = this.connectReject = null;
 
-      this.socket.onerror = (err: any) => {
-        console.error("🚨 WebSocket Error:", err);
-        this.state = StreamingState.ERROR;
-
-        if (this.handlers.onError) {
-          this.handlers.onError(err);
-        }
-      };
-
-      this.socket.onclose = (event: any) => {
-        console.log("❌ WebSocket Closed");
-        console.log(`Close Code: ${event.code}, Reason: ${event.reason}`);
-
-        this.isConnected = false;
-
-        if (this.reconnectAttempts < this.maxReconnectAttempts && !this.isUserStopped) {
-          this.reconnectAttempts++;
-          const delay = Math.min(this.reconnectDelay * this.reconnectAttempts, 10000);
-
-          console.log(
-            `🔄 Reconnecting... (Attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts}) ` +
-            `waiting ${delay}ms`
-          );
-
-          this.state = StreamingState.RECONNECTING;
-
-          setTimeout(() => {
-            this.connect(this.pendingSessionId);
-          }, delay);
-        } else {
-          console.error(
-            `❌ Max reconnection attempts (${this.maxReconnectAttempts}) reached or user stopped.`
-          );
-          this.state = StreamingState.IDLE;
-
-          if (this.handlers.onDisconnect) {
-            this.handlers.onDisconnect();
+          if (!this.isUserStopped && this.reconnectAttempts < this.maxReconnectAttempts) {
+            this.reconnectAttempts++;
+            const delay = Math.min(this.reconnectDelay * this.reconnectAttempts, 10000);
+            this.state = StreamingState.RECONNECTING;
+            setTimeout(() => this.connect(this.pendingSessionId).catch(console.error), delay);
+          } else {
+            this.state = StreamingState.IDLE;
+            this.handlers.onDisconnect?.();
           }
-        }
-      };
-    } catch (error) {
-      console.error("❌ Connection failed:", error);
-      this.state = StreamingState.ERROR;
-
-      if (this.handlers.onError) {
-        this.handlers.onError(error);
+        };
+      } catch (err) {
+        this.state = StreamingState.ERROR;
+        this.connectResolve = this.connectReject = null;
+        reject(err);
+        this.handlers.onError?.(err);
       }
-    }
+    });
   }
 
+  // ── Disconnect ────────────────────────────────────────────────────────────
   disconnect() {
-    console.log("🔌 Disconnecting...");
     this.isUserStopped = true;
-    this.reconnectAttempts = this.maxReconnectAttempts;
-
+    this.connectReject?.(new Error("User disconnected"));
+    this.connectResolve = this.connectReject = null;
     if (this.socket) {
+      this.socket.onopen = this.socket.onmessage =
+      this.socket.onerror = this.socket.onclose = null;
       this.socket.close();
       this.socket = null;
     }
-
     this.isConnected = false;
-    this.state = StreamingState.IDLE;
+    this.state       = StreamingState.IDLE;
+    this.handlers.onDisconnect?.();
   }
 
+  // ── Send query ────────────────────────────────────────────────────────────
   sendInitWithQuery(userQuery: string) {
-    if (!this.socket || !this.isConnected) {
-      console.error("❌ Not connected. Call connect() first.");
-      return;
-    }
+    if (!this.socket || !this.isConnected) { console.error("❌ Not connected"); return; }
 
-    console.log("📤 Sending query:", userQuery);
-    this.state = StreamingState.STREAM_STARTING;
-
+    this.state         = StreamingState.STREAMING;
     this.isUserStopped = false;
-    this.chunkCounter = 0;
+    this.chunkCounter  = 0;
+    this.playbackQueue = Promise.resolve();
 
     const payload = {
       concierge_name: "stormee",
-      request_id: `requestId-${this.generateUUID()}`,
-      agent_arguments: {
-        user_query: userQuery,
-      },
-      chat_history: [],
+      request_id:     `requestId-${this.generateUUID()}`,
+      agent_arguments: { user_query: userQuery },
+      chat_history:   [],
       metadata: JSON.stringify({
-        chat_history: [],
-        rlef_id: "",
-        mode_parameters: {},
-        mongo_db_id: "",
-        template_name: "open_brainstorming",
-        context: "",
-        user_id: "68fbb9ec1fff8606d6b61b93",
-        project_id: "69948177cb0b34761aa56e0e",
+        chat_history: [], rlef_id: "", mode_parameters: {}, mongo_db_id: "",
+        template_name: "open_brainstorming", context: "",
+        user_id:      "68fbb9ec1fff8606d6b61b93",
+        project_id:   "69948177cb0b34761aa56e0e",
         delay_on_initial_message: 0,
         query_number: "-1",
-        userEmailId: "vikas.as@techolution.com",
-        userName: "Vikas A S",
-        modeName: "BrainStorm Mode",
+        userEmailId:  "vikas.as@techolution.com",
+        userName:     "Vikas A S",
+        modeName:     "BrainStorm Mode",
       }),
-      session_id: this.generateUUID(),
-      query_number: "-1",
+      session_id:       this.generateUUID(),
+      query_number:     "-1",
       resumption_token: "",
     };
 
-    this.lastRequest = payload;
-    this.lastRequestId = payload.request_id;
-
     try {
-      const payloadStr = JSON.stringify(payload);
-      console.log(`📊 Sending payload: ${payloadStr.length} bytes`);
-
-      this.socket.send(payloadStr);
-      console.log("✅ Query sent successfully");
-    } catch (error) {
-      console.error("❌ Failed to send query:", error);
+      this.socket.send(JSON.stringify(payload));
+      console.log("✅ Query sent");
+    } catch (err) {
+      console.error("❌ Send failed:", err);
       this.state = StreamingState.ERROR;
-
-      if (this.handlers.onError) {
-        this.handlers.onError(error);
-      }
+      this.handlers.onError?.(err);
     }
   }
 
+  // ── Send ACK (required — backend uses for flow control) ──────────────────
+  private sendAck(tokenId: string) {
+    if (!this.socket || !this.isConnected || !tokenId) return;
+    try { this.socket.send(JSON.stringify({ ack: tokenId })); }
+    catch (err) { console.warn("⚠️ ACK failed:", err); }
+  }
+
+  // ── Message handler ───────────────────────────────────────────────────────
   private async handleMessage(event: any) {
     if (!event.data) return;
-
     try {
       if (event.data instanceof ArrayBuffer) {
-        if (this.isUserStopped) {
-          console.log("[MESSAGE] Discarding audio chunk - user stopped");
-          return;
-        }
-
-        await this.bufferAudioChunk(event.data);
+        if (!this.isUserStopped) await this.processFrame(event.data);
       } else if (typeof event.data === "string") {
-        try {
-          const jsonData = JSON.parse(event.data);
-          console.log("📨 Received JSON:", jsonData);
-
-          await this.processJSONMessage(jsonData);
-        } catch (parseError) {
-          console.warn("⚠️ Could not parse JSON:", event.data);
-        }
+        try { await this.processJSON(JSON.parse(event.data)); }
+        catch { console.warn("⚠️ Non-JSON:", (event.data as string).slice(0, 80)); }
       }
-    } catch (error) {
-      console.error("🚨 Error handling message:", error);
-      this.state = StreamingState.ERROR;
-
-      if (this.handlers.onError) {
-        this.handlers.onError(error);
-      }
+    } catch (err) {
+      console.error("🚨 handleMessage:", err);
+      this.handlers.onError?.(err);
     }
   }
 
-  // ✅ NEW: Buffer audio chunks
-  // Add this to your StormeeServiceRN.ts - REPLACE the bufferAudioChunk function
+  // ── Process binary frame ──────────────────────────────────────────────────
+  private async processFrame(data: ArrayBuffer) {
+    this.chunkCounter++;
+    const raw = new Uint8Array(data);
 
-  // ✅ Auto-play timer
-  private autoPlayTimer: ReturnType<typeof setTimeout> | null = null;
-  private readonly AUTO_PLAY_DELAY = 2000; // 2 seconds after last chunk
-
-  private async bufferAudioChunk(data: ArrayBuffer): Promise<void> {
-    try {
-      this.chunkCounter++;
-      const uint8Array = new Uint8Array(data);
-
-      console.log("🎵 Received audio chunk:", {
-        chunkNumber: this.chunkCounter,
-        size: uint8Array.length,
-        bytes: `${uint8Array.length} bytes`,
-      });
-
-      // Skip empty chunks
-      if (uint8Array.length === 0) {
-        console.log("⏭️ Skipping empty chunk");
-        return;
-      }
-
-      // Skip first metadata chunk
-      if (this.chunkCounter === 1) {
-        console.log("⏭️ Skipping chunk 1 (metadata)");
-        return;
-      }
-
-      this.state = StreamingState.STREAMING;
-
-      // ✅ Add to buffer
-      this.audioBuffer.push(uint8Array);
-      this.totalAudioBytes += uint8Array.length;
-      this.bufferedChunkCount++;
-
-      console.log(`📦 Buffered chunk ${this.bufferedChunkCount}: ${uint8Array.length} bytes (Total: ${this.totalAudioBytes} bytes)`);
-
-      // ✅ Clear previous timer
-      if (this.autoPlayTimer) {
-        clearTimeout(this.autoPlayTimer);
-        console.log("⏱️ Resetting auto-play timer...");
-      }
-
-      // ✅ Set new timer - play after 2 seconds of silence (no new chunks)
-      this.autoPlayTimer = setTimeout(async () => {
-        console.log("⏱️ Auto-play timer expired - playing buffered audio!");
-        await this.playBufferedAudio();
-      }, this.AUTO_PLAY_DELAY);
-
-      if (this.handlers.onAudioChunk) {
-        this.handlers.onAudioChunk(uint8Array, this.chunkCounter);
-      }
-
-      if (this.handlers.onChunkProcessed) {
-        this.handlers.onChunkProcessed({
-          chunkNumber: this.chunkCounter,
-          size: uint8Array.length,
-        });
-      }
-    } catch (error) {
-      console.error("❌ Error buffering audio chunk:", error);
-    }
-  }
-
-  async playWAVFile(): Promise<string> {
-  console.log("🧪 [TEST] Calling playWAVFile from service...");
-  try {
-    const result = await StormeeAudioModule.playWAVFile();
-    console.log("✅ WAV playback result:", result);
-    return result;
-  } catch (error) {
-    console.error("❌ WAV playback failed:", error);
-    throw error;
-  }
-}
-
-  // ✅ Also add this to the processJSONMessage function
-
-  private async processJSONMessage(data: any): Promise<void> {
-    const messageType = data.type;
-
-    switch (messageType) {
-      case "error":
-        console.error("🚨 Server error:", data.message);
-        this.state = StreamingState.ERROR;
-
-        if (this.handlers.onError) {
-          this.handlers.onError(new Error(data.message || "Server error"));
-        }
-        break;
-
-      case "stream_started":
-        console.log("📍 Stream started");
-        this.state = StreamingState.STREAMING;
-
-        if (this.handlers.onStreamStart) {
-          this.handlers.onStreamStart();
-        }
-        break;
-
-      case "stream_stopped":
-        console.log("📍 Stream stopped (from backend)");
-        this.state = StreamingState.CONNECTED;
-
-        // ✅ Clear timer and play immediately
-        if (this.autoPlayTimer) {
-          clearTimeout(this.autoPlayTimer);
-        }
-        await this.playBufferedAudio();
-
-        try {
-          await StormeeAudioModule.stop();
-          console.log("⏹️ Audio stopped");
-        } catch (stopError) {
-          console.error("❌ Stop audio error:", stopError);
-        }
-
-        if (this.handlers.onStreamEnd) {
-          this.handlers.onStreamEnd();
-        }
-        break;
-
-      default:
-        console.log("📨 Unknown message type:", messageType);
-    }
-  }
-
-  // ✅ NEW: Combine all buffered chunks and send to Swift
-  async playBufferedAudio(): Promise<void> {
-    if (this.audioBuffer.length === 0) {
-      console.warn("⚠️ No audio buffered");
+    if (raw.length === 0) {
+      console.log(`⏭️  #${this.chunkCounter} empty — skip`);
       return;
     }
 
-    try {
-      console.log(`🎵 Combining ${this.bufferedChunkCount} chunks (${this.totalAudioBytes} bytes)...`);
+    // First chunk is always a config/handshake packet with no audio
+    if (this.chunkCounter === 1) {
+      console.log(`⏭️  #1 config (${raw.length}B) — skip`);
+      return;
+    }
 
-      // Combine all chunks into one buffer
-      const combinedBuffer = new Uint8Array(this.totalAudioBytes);
-      let offset = 0;
+    if (this.chunkCounter === 2) {
+      const hex = Array.from(raw.slice(0, 32)).map(b => b.toString(16).padStart(2,"0")).join(" ");
+      console.log(`🔬 #2 header bytes: ${hex}`);
+    }
 
-      for (const chunk of this.audioBuffer) {
-        combinedBuffer.set(chunk, offset);
-        offset += chunk.length;
+    // Parse the msgpack frame → { tokenId, opusBytes, transcription, ... }
+    const frame = parseFrame(raw);
+
+    // ACK immediately — backend stops sending without this
+    if (frame.tokenId) this.sendAck(frame.tokenId);
+
+    // Transcription (filter internal metadata strings)
+    if (frame.transcription) {
+      const tx = frame.transcription;
+      const internal = tx.startsWith("{") ||
+                       tx.includes("<cognitive_reasoning>") ||
+                       tx.includes("<answerExample");
+      if (!internal) {
+        console.log(`📝 "${tx.slice(0, 80)}"`);
+        this.handlers.onTranscription?.(tx, frame.chunkNumber ?? this.chunkCounter);
       }
+    }
 
-      console.log(`✅ Combined buffer ready: ${combinedBuffer.length} bytes`);
+    if (frame.headerMessage) this.handlers.onHeaderMessage?.(frame.headerMessage);
 
-      // Convert to Base64
-      const base64Data = Buffer.from(combinedBuffer).toString("base64");
-      console.log(`📝 Base64 encoded: ${base64Data.length} characters`);
+    // No audio this frame — skip
+    if (!frame.opusBytes || frame.opusBytes.length === 0) {
+      console.log(`⏭️  #${this.chunkCounter} no audio`);
+      return;
+    }
 
-      // Send once to native module
-      console.log("📤 Sending combined audio to native module...");
-      const result = await StormeeAudioModule.writeAudioFrame(base64Data);
-      console.log(`✅ Audio sent to native module! Result: ${result}`);
+    const opus = frame.opusBytes;
+    const toc  = opus[0];
+    console.log(`🎵 #${this.chunkCounter}: ${raw.length}B → ${opus.length}B Opus | TOC=0x${toc.toString(16)} config=${toc>>3} mono=${((toc>>2)&1)===0}`);
 
-      // Clear buffer
-      this.audioBuffer = [];
-      this.totalAudioBytes = 0;
-      this.bufferedChunkCount = 0;
+    // Encode for native bridge
+    const b64 = Buffer.from(opus).toString("base64");
 
-    } catch (error) {
-      console.error("❌ Error playing buffered audio:", error);
-      this.state = StreamingState.ERROR;
-
-      if (this.handlers.onError) {
-        this.handlers.onError(error);
+    // Queue ensures sequential playback even under async native calls
+    this.playbackQueue = this.playbackQueue.then(async () => {
+      try {
+        const result = await StormeeAudioModule.writeAudioFrame(b64);
+        console.log(`✅ #${this.chunkCounter} played: ${result}`);
+      } catch (err) {
+        console.error(`❌ #${this.chunkCounter} native error:`, err);
       }
+    });
+
+    this.handlers.onAudioChunk?.(opus, this.chunkCounter);
+    this.handlers.onChunkProcessed?.({ chunkNumber: this.chunkCounter, size: opus.length });
+  }
+
+  // ── Process JSON control messages ─────────────────────────────────────────
+  private async processJSON(data: any) {
+    if (data.ack) return; // ack echo from server — ignore
+
+    switch (data.type) {
+      case "stream_started":
+        this.chunkCounter  = 0;
+        this.playbackQueue = Promise.resolve();
+        this.handlers.onStreamStart?.();
+        break;
+      case "stream_stopped":
+        await this.playbackQueue;
+        try { await StormeeAudioModule.stop(); } catch { /* ignore */ }
+        this.state = StreamingState.CONNECTED;
+        this.handlers.onStreamEnd?.();
+        break;
+      case "error":
+        console.error("🚨 Server error:", data.message);
+        this.state = StreamingState.ERROR;
+        this.handlers.onError?.(new Error(data.message || "Server error"));
+        break;
     }
   }
 
-  
+  async playWAVFile() { return StormeeAudioModule.playWAVFile(); }
 
-  private generateUUID(): string {
-    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function (c) {
+  private generateUUID() {
+    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
       const r = (Math.random() * 16) | 0;
-      const v = c === "x" ? r : (r & 0x3) | 0x8;
-      return v.toString(16);
+      return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
     });
   }
 }

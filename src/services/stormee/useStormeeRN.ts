@@ -1,8 +1,7 @@
 // src/services/stormee/useStormeeRN.ts
 
 import { useEffect, useRef, useState } from "react";
-import { StormeeClientRN } from "./ StormeeClient"
-import StormeeServiceRN from "./StormeeServiceRN";
+import { StormeeClientRN } from "./ StormeeClient";
 
 export function useStormeeRN(visible: boolean) {
   const [transcription, setTranscription] = useState("");
@@ -10,17 +9,17 @@ export function useStormeeRN(visible: boolean) {
 
   const clientRef = useRef<StormeeClientRN | null>(null);
 
-  // IMPORTANT: use Mac IP (not localhost)
-  const WS_URL = "wss://devllmstudio.creativeworkspace.ai/stormee-asgi-server/ws";
+  const WS_URL =
+    "wss://devllmstudio.creativeworkspace.ai/stormee-asgi-server/ws";
   const SESSION_ID = "3b309fad-aefb-42d4-8fdc-7e794f24e14b";
 
-  // create client once
+  // ✅ Create the client once on mount
   useEffect(() => {
     clientRef.current = new StormeeClientRN({
       wsUrl: WS_URL,
       sessionId: SESSION_ID,
       onTranscription: (text) => setTranscription(text),
-      onError: (err) => console.log("Stormee Error:", err),
+      onError: (err) => console.error("[useStormeeRN] Error:", err),
       onConnect: () => setConnected(true),
       onDisconnect: () => setConnected(false),
     });
@@ -31,7 +30,7 @@ export function useStormeeRN(visible: boolean) {
     };
   }, []);
 
-  // connect/disconnect based on modal visibility
+  // ✅ Connect / disconnect based on modal visibility
   useEffect(() => {
     if (!visible) return;
     if (!clientRef.current) return;
@@ -40,38 +39,40 @@ export function useStormeeRN(visible: boolean) {
 
     (async () => {
       try {
-        console.log("Stormee connecting...");
+        console.log("[useStormeeRN] Connecting...");
         await clientRef.current?.connect();
 
         if (cancelled) return;
 
-        console.log("Stormee connected ✅");
+        console.log("[useStormeeRN] Connected ✅");
         setConnected(true);
       } catch (e) {
-        console.log("Stormee connect failed:", e);
-        setConnected(false);
+        if (!cancelled) {
+          console.error("[useStormeeRN] Connect failed:", e);
+          setConnected(false);
+        }
       }
     })();
 
     return () => {
       cancelled = true;
-      console.log("Stormee disconnecting...");
+      console.log("[useStormeeRN] Disconnecting...");
       clientRef.current?.disconnect();
       setConnected(false);
     };
   }, [visible]);
 
   const send = async (text: string) => {
-    if (!clientRef.current) return;
+    if (!clientRef.current) {
+      console.warn("[useStormeeRN] send() called but client is not ready");
+      return;
+    }
     await clientRef.current.startStreaming(text);
   };
-
-
 
   return {
     transcription,
     connected,
     send,
-    // playAudio
   };
 }

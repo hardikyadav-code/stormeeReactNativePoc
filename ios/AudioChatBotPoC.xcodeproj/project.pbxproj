@@ -10,6 +10,7 @@
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
 		81AB9BB82411601600AC10FF /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */; };
 		8C3343D4802005670C07D31E /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */; };
+		990D747B2F4D7ADE009D4E67 /* test.wav in Resources */ = {isa = PBXBuildFile; fileRef = 990D747A2F4D7ADE009D4E67 /* test.wav */; };
 		9915DCE62F4C4C5500E482E6 /* StormeeAudioBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = 9915DCE52F4C4C4B00E482E6 /* StormeeAudioBridge.m */; };
 		993FA8672F48CD2A00662D13 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 993FA8662F48CD2A00662D13 /* AppDelegate.swift */; };
 		993FA86A2F498BB800662D13 /* StormeeAudioBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 993FA85F2F48B27B00662D13 /* StormeeAudioBridge.swift */; };
@@ -25,6 +26,7 @@
 		23469FA40251DDB32D736678 /* Pods-AudioChatBotPoC.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-AudioChatBotPoC.debug.xcconfig"; path = "Target Support Files/Pods-AudioChatBotPoC/Pods-AudioChatBotPoC.debug.xcconfig"; sourceTree = "<group>"; };
 		761780EC2CA45674006654EE /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = AudioChatBotPoC/AppDelegate.swift; sourceTree = "<group>"; };
 		81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.storyboard; name = LaunchScreen.storyboard; path = AudioChatBotPoC/LaunchScreen.storyboard; sourceTree = "<group>"; };
+		990D747A2F4D7ADE009D4E67 /* test.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; path = test.wav; sourceTree = "<group>"; };
 		9915DCE52F4C4C4B00E482E6 /* StormeeAudioBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = StormeeAudioBridge.m; sourceTree = "<group>"; };
 		993FA85F2F48B27B00662D13 /* StormeeAudioBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StormeeAudioBridge.swift; path = AudioChatBotPoC/StormeeAudioBridge.swift; sourceTree = "<group>"; };
 		993FA8662F48CD2A00662D13 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = AudioChatBotPoC/AppDelegate.swift; sourceTree = "<group>"; };
@@ -49,6 +51,7 @@
 			children = (
 				13B07FB51A68108700A75B9A /* Images.xcassets */,
 				993FA85F2F48B27B00662D13 /* StormeeAudioBridge.swift */,
+				990D747A2F4D7ADE009D4E67 /* test.wav */,
 				9915DCE52F4C4C4B00E482E6 /* StormeeAudioBridge.m */,
 				761780EC2CA45674006654EE /* AppDelegate.swift */,
 				13B07FB61A68108700A75B9A /* Info.plist */,
@@ -166,6 +169,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				990D747B2F4D7ADE009D4E67 /* test.wav in Resources */,
 				81AB9BB82411601600AC10FF /* LaunchScreen.storyboard in Resources */,
 				13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */,
 				8C3343D4802005670C07D31E /* PrivacyInfo.xcprivacy in Resources */,
@@ -199,9 +203,13 @@
 			inputFileListPaths = (
 				"${PODS_ROOT}/Target Support Files/Pods-AudioChatBotPoC/Pods-AudioChatBotPoC-resources-${CONFIGURATION}-input-files.xcfilelist",
 			);
+			inputPaths = (
+			);
 			name = "[CP] Copy Pods Resources";
 			outputFileListPaths = (
 				"${PODS_ROOT}/Target Support Files/Pods-AudioChatBotPoC/Pods-AudioChatBotPoC-resources-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			outputPaths = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
@@ -216,9 +224,13 @@
 			inputFileListPaths = (
 				"${PODS_ROOT}/Target Support Files/Pods-AudioChatBotPoC/Pods-AudioChatBotPoC-frameworks-${CONFIGURATION}-input-files.xcfilelist",
 			);
+			inputPaths = (
+			);
 			name = "[CP] Embed Pods Frameworks";
 			outputFileListPaths = (
 				"${PODS_ROOT}/Target Support Files/Pods-AudioChatBotPoC/Pods-AudioChatBotPoC-frameworks-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			outputPaths = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;

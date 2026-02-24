@@ -8,14 +8,6 @@ require Pod::Executable.execute_command('node', ['-p',
 platform :ios, min_ios_version_supported
 prepare_react_native_project!
 
-# 🔥 DISABLE NEW ARCH (VERY IMPORTANT)
-# ENV['RCT_NEW_ARCH_ENABLED'] = '0'
-
-# 🔥 DO NOT USE FRAMEWORKS (prevents modular header crash)
-# If you previously set USE_FRAMEWORKS in env, remove it
-# or force static linkage:
-# use_frameworks! :linkage => :static   # <-- only if absolutely needed
-
 target 'AudioChatBotPoC' do
   config = use_native_modules!
 
@@ -24,7 +16,7 @@ target 'AudioChatBotPoC' do
     :app_path => "#{Pod::Config.instance.installation_root}/..",
     :hermes_enabled => true,
     :fabric_enabled => false,
-    :new_arch_enabled => false   # 🔥 important
+    :new_arch_enabled => false
   )
 
   post_install do |installer|
@@ -34,10 +26,16 @@ target 'AudioChatBotPoC' do
       :mac_catalyst_enabled => false
     )
 
-    # 🔥 FIX FOR NON-MODULAR HEADER ERROR
     installer.pods_project.targets.each do |target|
       target.build_configurations.each do |config|
+
+        # Allow non modular headers
         config.build_settings['CLANG_ALLOW_NON_MODULAR_INCLUDES_IN_FRAMEWORK_MODULES'] = 'YES'
+
+        # 🚀 VERY IMPORTANT FIX
+        config.build_settings['GCC_TREAT_WARNINGS_AS_ERRORS'] = 'NO'
+        config.build_settings['SWIFT_TREAT_WARNINGS_AS_ERRORS'] = 'NO'
+
       end
     end
   end

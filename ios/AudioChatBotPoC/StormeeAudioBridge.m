@@ -1,25 +1,24 @@
+//
+//  StormeeAudioBridge.m
+//  AudioChatBotPoC
+//
+
 #import <React/RCTBridgeModule.h>
 
-@interface RCT_EXTERN_MODULE(StormeeAudioBridge, NSObject)
+@interface RCT_EXTERN_MODULE(StormeeAudioModule, NSObject)
 
-RCT_EXTERN_METHOD(initialize:(NSDictionary *)config
-                  resolver:(RCTPromiseResolveBlock)resolve
-                  rejecter:(RCTPromiseRejectBlock)reject)
-
-RCT_EXTERN_METHOD(startPlayback:(RCTPromiseResolveBlock)resolve
-                  rejecter:(RCTPromiseRejectBlock)reject)
-
-RCT_EXTERN_METHOD(stopPlayback:(RCTPromiseResolveBlock)resolve
+RCT_EXTERN_METHOD(initialize:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
 
 RCT_EXTERN_METHOD(writeAudioFrame:(NSString *)base64Data
                   resolver:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
 
-RCT_EXTERN_METHOD(getPlaybackMetrics:(RCTPromiseResolveBlock)resolve
+RCT_EXTERN_METHOD(stop:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
 
-RCT_EXTERN_METHOD(terminate:(RCTPromiseResolveBlock)resolve
-                  rejecter:(RCTPromiseRejectBlock)reject)
+@end
 
+// Dummy implementation to satisfy the linker
+@implementation StormeeAudioBridge
 @end

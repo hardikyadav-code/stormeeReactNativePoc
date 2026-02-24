@@ -1,297 +1,334 @@
+// StormeeAudioModule.swift - WITH BETTER WAV FILE DETECTION
+
 import Foundation
 import AVFoundation
+import AudioToolbox
 import React
 
-@objc(StormeeAudioBridge)
-class StormeeAudioBridge: NSObject {
+@objc(StormeeAudioModule)
+class StormeeAudioModule: NSObject {
 
-  private var engine: AVAudioEngine?
-  private var playerNode: AVAudioPlayerNode?
-  private var format: AVAudioFormat?
+    private var audioEngine: AVAudioEngine?
+    private var playerNode: AVAudioPlayerNode?
+    private var converter: AudioConverterRef?
+    private var format: AVAudioFormat?
+    private var audioFile: AVAudioFile?
 
-  @objc
-  static func moduleName() -> String! {
-    return "StormeeAudioBridge"
-  }
+    @objc
+    func initialize(_ resolve: @escaping RCTPromiseResolveBlock,
+                    rejecter reject: @escaping RCTPromiseRejectBlock) {
 
-  @objc
-  static func requiresMainQueueSetup() -> Bool {
-    return true
-  }
+        do {
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.setCategory(.playback, mode: .default, options: [.duckOthers])
+            try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+            
+            print("✅ Audio session configured for playback")
 
-  override init() {
-    super.init()
-    NSLog("🎵 [StormeeAudioBridge] INIT CALLED")
-    setupAudioEngine()
-  }
+            audioEngine = AVAudioEngine()
+            playerNode = AVAudioPlayerNode()
 
-  private func setupAudioEngine() {
-    NSLog("🎵 [StormeeAudioBridge] setupAudioEngine() called")
-    
-    DispatchQueue.main.async { [weak self] in
-      guard let self = self else {
-        NSLog("❌ [StormeeAudioBridge] setupAudioEngine - self is nil")
-        return
-      }
-      
-      do {
-        NSLog("🎵 [StormeeAudioBridge] Configuring audio session...")
-        
-        let audioSession = AVAudioSession.sharedInstance()
-        try audioSession.setCategory(
-          .playAndRecord,
-          mode: .default,
-          options: [.duckOthers, .defaultToSpeaker]
-        )
-        try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
-        
-        NSLog("✅ [StormeeAudioBridge] Audio session configured")
+            guard let engine = audioEngine,
+                  let player = playerNode else {
+                reject("INIT_ERROR", "Engine init failed", nil)
+                return
+            }
 
-        NSLog("🎵 [StormeeAudioBridge] Creating audio engine...")
-        self.engine = AVAudioEngine()
-        guard let engine = self.engine else {
-          NSLog("❌ [StormeeAudioBridge] Failed to create engine")
-          return
+            engine.attach(player)
+
+            format = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: 24000,
+                channels: 1,
+                interleaved: false
+            )
+
+            engine.connect(player, to: engine.mainMixerNode, format: format)
+            try engine.start()
+            
+            print("✅ Audio engine started")
+            print("📊 Audio format: \(String(describing: format))")
+            setupOpusConverter()
+            resolve("initialized")
+
+        } catch {
+            print("❌ Initialization error: \(error)")
+            reject("ENGINE_ERROR", "Audio engine failed: \(error.localizedDescription)", error)
         }
-
-        self.format = AVAudioFormat(
-          standardFormatWithSampleRate: 24000,
-          channels: 1
-        )
-        
-        NSLog("✅ [StormeeAudioBridge] Format created: 24kHz, 1 channel")
-
-        self.playerNode = AVAudioPlayerNode()
-        guard let playerNode = self.playerNode, let format = self.format else {
-          NSLog("❌ [StormeeAudioBridge] Failed to create player or format")
-          return
-        }
-
-        engine.attach(playerNode)
-        engine.connect(playerNode, to: engine.mainMixerNode, format: format)
-        
-        NSLog("✅ [StormeeAudioBridge] Player attached to engine")
-
-        if !engine.isRunning {
-          try engine.start()
-          NSLog("✅ [StormeeAudioBridge] Audio engine started")
-        }
-      } catch {
-        NSLog("❌ [StormeeAudioBridge] Setup error: %@", error.localizedDescription)
-      }
     }
-  }
 
-  @objc(initialize:resolver:rejecter:)
-  func initialize(
-    config: NSDictionary,
-    resolver resolve: @escaping RCTPromiseResolveBlock,
-    rejecter reject: @escaping RCTPromiseRejectBlock
-  ) {
-    NSLog("🎵 [StormeeAudioBridge] initialize() called with config: %@", config)
-    
-    DispatchQueue.main.async { [weak self] in
-      guard let self = self else {
-        NSLog("❌ [StormeeAudioBridge] initialize - self is nil")
-        reject("ERROR", "Self deallocated", nil)
-        return
-      }
+    private func setupOpusConverter() {
+        var inputFormat = AudioStreamBasicDescription()
+        inputFormat.mSampleRate = 24000
+        inputFormat.mFormatID = kAudioFormatOpus
+        inputFormat.mChannelsPerFrame = 1
+        inputFormat.mFramesPerPacket = 0
 
-      do {
-        let sampleRate = config["sampleRate"] as? Double ?? 24000
-        let channels = config["channels"] as? AVAudioChannelCount ?? 1
+        var outputFormatDesc = AudioStreamBasicDescription()
+        outputFormatDesc.mSampleRate = 24000
+        outputFormatDesc.mFormatID = kAudioFormatLinearPCM
+        outputFormatDesc.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
+        outputFormatDesc.mBitsPerChannel = 32
+        outputFormatDesc.mChannelsPerFrame = 1
+        outputFormatDesc.mFramesPerPacket = 1
+        outputFormatDesc.mBytesPerFrame = 4
+        outputFormatDesc.mBytesPerPacket = 4
 
-        self.format = AVAudioFormat(
-          standardFormatWithSampleRate: sampleRate,
-          channels: channels
-        )
+        let status = AudioConverterNew(&inputFormat, &outputFormatDesc, &converter)
+        if status != noErr {
+            print("❌ Failed to create Opus converter:", status)
+        } else {
+            print("✅ Opus converter ready")
+        }
+    }
+
+    // ✅ UPDATED: Better WAV file detection
+    @objc
+    func playWAVFile(_ resolve: @escaping RCTPromiseResolveBlock,
+                     rejecter reject: @escaping RCTPromiseRejectBlock) {
         
-        NSLog("✅ [StormeeAudioBridge] Format updated: %.0f Hz, %u channels", sampleRate, channels)
-
-        try AVAudioSession.sharedInstance().setActive(true)
-
-        resolve(["status": "initialized"])
-      } catch {
-        NSLog("❌ [StormeeAudioBridge] initialize error: %@", error.localizedDescription)
-        reject("ERROR", error.localizedDescription, error)
-      }
-    }
-  }
-
-  @objc(startPlayback:rejecter:)
-  func startPlayback(
-    resolver resolve: @escaping RCTPromiseResolveBlock,
-    rejecter reject: @escaping RCTPromiseRejectBlock
-  ) {
-    NSLog("▶️ [StormeeAudioBridge] startPlayback() called")
-    
-    DispatchQueue.main.async { [weak self] in
-      guard let playerNode = self?.playerNode else {
-        NSLog("❌ [StormeeAudioBridge] startPlayback - no playerNode")
-        reject("ERROR", "Not initialized", nil)
-        return
-      }
-
-      if !playerNode.isPlaying {
-        playerNode.play()
-        NSLog("▶️ [StormeeAudioBridge] Player started")
-      } else {
-        NSLog("ℹ️ [StormeeAudioBridge] Player already playing")
-      }
-
-      resolve(["status": "playing"])
-    }
-  }
-
-  @objc(stopPlayback:rejecter:)
-  func stopPlayback(
-    resolver resolve: @escaping RCTPromiseResolveBlock,
-    rejecter reject: @escaping RCTPromiseRejectBlock
-  ) {
-    NSLog("⏹️ [StormeeAudioBridge] stopPlayback() called")
-    
-    DispatchQueue.main.async { [weak self] in
-      guard let playerNode = self?.playerNode else {
-        NSLog("❌ [StormeeAudioBridge] stopPlayback - no playerNode")
-        reject("ERROR", "Not initialized", nil)
-        return
-      }
-
-      if playerNode.isPlaying {
-        playerNode.stop()
-        NSLog("⏹️ [StormeeAudioBridge] Player stopped")
-      }
-
-      resolve(["status": "stopped"])
-    }
-  }
-
-  @objc(writeAudioFrame:resolver:rejecter:)
-  func writeAudioFrame(
-    base64Data: String,
-    resolver resolve: @escaping RCTPromiseResolveBlock,
-    rejecter reject: @escaping RCTPromiseRejectBlock
-  ) {
-    DispatchQueue.main.async { [weak self] in
-      guard let self = self else {
-        NSLog("❌ [StormeeAudioBridge] writeAudioFrame - self is nil")
-        reject("ERROR", "Self deallocated", nil)
-        return
-      }
-
-      do {
-        guard let rawData = Data(base64Encoded: base64Data) else {
-          NSLog("❌ [StormeeAudioBridge] Invalid base64 data")
-          reject("DECODE_ERROR", "Invalid base64", nil)
-          return
-        }
-
-        guard let format = self.format,
-              let playerNode = self.playerNode else {
-          NSLog("❌ [StormeeAudioBridge] Not initialized (no format or playerNode)")
-          reject("STATE_ERROR", "Not initialized", nil)
-          return
-        }
-
-        let frameCapacity = UInt32(rawData.count / 2)
+        print("🎵 [TEST] Attempting to play WAV file from bundle...")
         
-        NSLog("📝 [StormeeAudioBridge] writeAudioFrame: %u frames", frameCapacity)
-
-        guard let audioBuffer = AVAudioPCMBuffer(
-          pcmFormat: format,
-          frameCapacity: frameCapacity
-        ) else {
-          NSLog("❌ [StormeeAudioBridge] Failed to create buffer")
-          reject("BUFFER_ERROR", "Failed to create buffer", nil)
-          return
-        }
-
-        audioBuffer.frameLength = frameCapacity
-
-        // Convert Int16 to Float32
-        rawData.withUnsafeBytes { rawBytes in
-          let int16Ptr = rawBytes.bindMemory(to: Int16.self)
-          let floatChannelData = audioBuffer.floatChannelData![0]
-
-          for frame in 0..<Int(frameCapacity) {
-            let int16Sample = int16Ptr[frame]
-            floatChannelData[frame] = Float(int16Sample) / 32768.0
-          }
+        guard let engine = audioEngine,
+              let playerNode = playerNode else {
+            reject("ERROR", "Engine not ready", nil)
+            return
         }
         
-        NSLog("✅ [StormeeAudioBridge] Converted %u Int16 frames to Float32", frameCapacity)
+        do {
+            // Try to find WAV file - list common names
+            var wavURL: URL?
+            
+            // Try common names first
+            let possibleNames = [
+                "test",  // Most likely after renaming
+                "audio",
+                "sample",
+                "693ff8790dec6629c2d92da4__online-video-cutter_com___1_"  // Original filename
+            ]
+            
+            for name in possibleNames {
+                if let url = Bundle.main.url(forResource: name, withExtension: "wav") {
+                    wavURL = url
+                    print("✅ Found WAV file: \(name).wav")
+                    break
+                }
+            }
+            
+            // If still not found, list what's actually in the bundle
+            guard let wavURL = wavURL else {
+                print("❌ WAV file not found in bundle!")
+                print("📂 Checking bundle contents...")
+                
+                if let resourcePath = Bundle.main.resourcePath {
+                    let fileManager = FileManager.default
+                    do {
+                        let contents = try fileManager.contentsOfDirectory(atPath: resourcePath)
+                        let wavFiles = contents.filter { $0.lowercased().hasSuffix(".wav") }
+                        print("Found WAV files in bundle: \(wavFiles)")
+                        
+                        if wavFiles.isEmpty {
+                            print("⚠️ No WAV files found! Please add a .wav file to Xcode:")
+                            print("   1. Right-click project in Xcode")
+                            print("   2. Select 'Add Files to AudioChatBotPoC'")
+                            print("   3. Select your WAV file")
+                            print("   4. Check 'Copy items if needed'")
+                            print("   5. Check 'AudioChatBotPoC' target")
+                            print("   6. Click 'Add'")
+                        }
+                    } catch {
+                        print("Error reading bundle: \(error)")
+                    }
+                }
+                
+                reject("FILE_NOT_FOUND", "No WAV file found in bundle. Check Xcode console for instructions.", nil)
+                return
+            }
+            
+            print("📂 Found WAV file at: \(wavURL)")
+            
+            // Load WAV file
+            let audioFile = try AVAudioFile(forReading: wavURL)
+            self.audioFile = audioFile
+            
+            print("📊 WAV File loaded:")
+            print("   Format: \(audioFile.processingFormat)")
+            print("   Sample rate: \(audioFile.processingFormat.sampleRate)")
+            print("   Channels: \(audioFile.processingFormat.channelCount)")
+            print("   Length: \(audioFile.length) frames")
+            
+            // Make sure engine is running
+            if !engine.isRunning {
+                try engine.start()
+                print("✅ Engine restarted")
+            }
+            
+            // Start playback
+            try playerNode.play()
+            print("▶️ Player started")
+            
+            // Schedule entire file for playback
+            try playerNode.scheduleFile(audioFile, at: nil)
+            
+            print("✅ WAV file scheduled for playback")
+            print("▶️ Now playing: \(wavURL.lastPathComponent)")
+            print("🔊 Listen to your simulator speaker!")
+            
+            resolve("playing")
+            
+        } catch {
+            print("❌ Error playing WAV file: \(error)")
+            reject("PLAY_ERROR", "Failed to play WAV: \(error.localizedDescription)", error)
+        }
+    }
 
-        // Schedule buffer
-        playerNode.scheduleBuffer(audioBuffer, completionHandler: nil)
-        
-        NSLog("✅ [StormeeAudioBridge] Buffer scheduled for playback")
+    @objc
+    func writeAudioFrame(_ base64Data: String,
+                        resolver resolve: @escaping RCTPromiseResolveBlock,
+                        rejecter reject: @escaping RCTPromiseRejectBlock) {
 
-        // Start playback if not already playing
-        if !playerNode.isPlaying {
-          playerNode.play()
-          NSLog("🔊 [StormeeAudioBridge] PLAYBACK STARTED! 🎵")
+        guard let opusFrameData = Data(base64Encoded: base64Data) else {
+            reject("DECODE_ERROR", "Invalid base64", nil)
+            return
         }
 
-        resolve([
-          "status": "frame_written",
-          "frames": frameCapacity
-        ])
-      } catch {
-        NSLog("❌ [StormeeAudioBridge] writeAudioFrame error: %@", error.localizedDescription)
-        reject("ERROR", error.localizedDescription, error)
-      }
-    }
-  }
-
-  @objc(getPlaybackMetrics:rejecter:)
-  func getPlaybackMetrics(
-    resolver resolve: @escaping RCTPromiseResolveBlock,
-    rejecter reject: @escaping RCTPromiseRejectBlock
-  ) {
-    DispatchQueue.main.async { [weak self] in
-      guard let self = self else {
-        reject("ERROR", "Self deallocated", nil)
-        return
-      }
-
-      resolve([
-        "isPlaying": self.playerNode?.isPlaying ?? false,
-        "sampleRate": Int(self.format?.sampleRate ?? 0),
-        "channels": Int(self.format?.channelCount ?? 0)
-      ])
-    }
-  }
-
-  @objc(terminate:rejecter:)
-  func terminate(
-    resolver resolve: @escaping RCTPromiseResolveBlock,
-    rejecter reject: @escaping RCTPromiseRejectBlock
-  ) {
-    NSLog("🛑 [StormeeAudioBridge] terminate() called")
-    
-    DispatchQueue.main.async { [weak self] in
-      guard let self = self else {
-        NSLog("❌ [StormeeAudioBridge] terminate - self is nil")
-        reject("ERROR", "Self deallocated", nil)
-        return
-      }
-
-      do {
-        if let playerNode = self.playerNode, playerNode.isPlaying {
-          playerNode.stop()
-          NSLog("⏹️ [StormeeAudioBridge] Player stopped in terminate")
+        guard let converter = converter,
+              let playerNode = playerNode,
+              let format = format,
+              let engine = audioEngine else {
+            reject("DECODE_ERROR", "Invalid state", nil)
+            return
         }
 
-        if let engine = self.engine, engine.isRunning {
-          try engine.stop()
-          NSLog("⏹️ [StormeeAudioBridge] Engine stopped in terminate")
+        do {
+            let (pcmData, decodedBytes) = try decodeOpusFrame(opusFrameData, converter: converter)
+
+            if decodedBytes == 0 {
+                print("⏭️ No audio decoded")
+                resolve("skipped")
+                return
+            }
+
+            let frameCount = decodedBytes / 4
+
+            guard frameCount > 0 else {
+                print("⏭️ Invalid frame count: \(frameCount)")
+                resolve("skipped")
+                return
+            }
+
+            guard let pcmBuffer = AVAudioPCMBuffer(
+                pcmFormat: format,
+                frameCapacity: AVAudioFrameCount(frameCount)
+            ) else {
+                reject("BUFFER_ERROR", "Buffer creation failed", nil)
+                return
+            }
+
+            pcmBuffer.frameLength = AVAudioFrameCount(frameCount)
+
+            let dataToUse = pcmData.prefix(Int(decodedBytes))
+            dataToUse.withUnsafeBytes { rawPtr in
+                if let baseAddress = rawPtr.baseAddress {
+                    memcpy(pcmBuffer.floatChannelData![0],
+                           baseAddress,
+                           Int(decodedBytes))
+                }
+            }
+
+            if engine.isRunning == false {
+                try engine.start()
+            }
+
+            playerNode.scheduleBuffer(pcmBuffer, completionHandler: nil)
+
+            if !playerNode.isPlaying {
+                try playerNode.play()
+                print("▶️ Audio playback started")
+            }
+
+            print("🎵 Scheduled audio buffer: \(frameCount) frames (\(decodedBytes) bytes)")
+            resolve("played")
+
+        } catch {
+            print("❌ Error: \(error)")
+            reject("DECODE_ERROR", "Opus decode failed", error)
+        }
+    }
+
+    private func decodeOpusFrame(_ opusData: Data, converter: AudioConverterRef) throws -> (Data, UInt32) {
+        let maxOutputFrames: UInt32 = 5760
+        let maxOutputBytes = maxOutputFrames * 4
+
+        var outputBuffer = Data(count: Int(maxOutputBytes))
+        var decodedByteSize: UInt32 = 0
+
+        let status = opusData.withUnsafeBytes { (inputPtr: UnsafeRawBufferPointer) -> OSStatus in
+            return outputBuffer.withUnsafeMutableBytes { (outputPtr: UnsafeMutableRawBufferPointer) -> OSStatus in
+
+                guard let inputBase = inputPtr.baseAddress else {
+                    return -1
+                }
+                guard let outputBase = outputPtr.baseAddress else {
+                    return -1
+                }
+
+                var inputBufferList = AudioBufferList(
+                    mNumberBuffers: 1,
+                    mBuffers: AudioBuffer(
+                        mNumberChannels: 1,
+                        mDataByteSize: UInt32(opusData.count),
+                        mData: UnsafeMutableRawPointer(mutating: inputBase)
+                    )
+                )
+
+                var outputBufferList = AudioBufferList(
+                    mNumberBuffers: 1,
+                    mBuffers: AudioBuffer(
+                        mNumberChannels: 1,
+                        mDataByteSize: UInt32(maxOutputBytes),
+                        mData: outputBase
+                    )
+                )
+
+                var numberInputPackets: UInt32 = 1
+
+                let status = AudioConverterConvertComplexBuffer(
+                    converter,
+                    numberInputPackets,
+                    &inputBufferList,
+                    &outputBufferList
+                )
+
+                decodedByteSize = outputBufferList.mBuffers.mDataByteSize
+                
+                if status == noErr && decodedByteSize > 0 {
+                    print("✅ Decoded \(decodedByteSize) bytes from Opus")
+                }
+
+                return status
+            }
         }
 
-        resolve(["status": "terminated"])
-      } catch {
-        NSLog("❌ [StormeeAudioBridge] terminate error: %@", error.localizedDescription)
-        reject("ERROR", error.localizedDescription, error)
-      }
+        if status != noErr {
+            print("❌ Opus decode failed: \(status)")
+            throw NSError(domain: "AudioConverter", code: Int(status), userInfo: nil)
+        }
+
+        return (outputBuffer, decodedByteSize)
     }
-  }
+
+    @objc
+    func stop(_ resolve: @escaping RCTPromiseResolveBlock,
+              rejecter reject: @escaping RCTPromiseRejectBlock) {
+
+        do {
+            playerNode?.stop()
+            try audioEngine?.stop()
+            print("⏹️ Audio stopped")
+            resolve("stopped")
+        } catch {
+            reject("STOP_ERROR", "Stop failed", error)
+        }
+    }
 }

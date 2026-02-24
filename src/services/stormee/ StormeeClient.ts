@@ -63,7 +63,7 @@ export class StormeeClientRN {
     patchReactNativeWebSocketTypes();
 
     this.sessionId = options.sessionId;
-    this.wsUrl = options.wsUrl || 'wss://devllmstudio.creativeworkspace.ai/stormee-asgi-server/ws';
+    this.wsUrl = 'wss://devllmstudio.creativeworkspace.ai/stormee-asgi-server/ws';
 
     // Wire service events to client callbacks
     if (this.service.setEventHandlers) {

@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { View, Text, Button, ScrollView, StyleSheet } from 'react-native';
+import { View, Text, Button, ScrollView, StyleSheet, TouchableOpacity } from 'react-native';
 import StormeeServiceRN from '../services/stormee/StormeeServiceRN';
 import { StormeeClientRN } from '../services/stormee/ StormeeClient';
 
@@ -74,6 +74,17 @@ export function AudioTest() {
     }
   };
 
+  // ✅ FIXED: Call from service instead of direct NativeModules
+  const handlePlayWAV = async () => {
+    try {
+      addLog('🧪 Testing WAV playback via service...');
+      const result = await StormeeServiceRN.playWAVFile();
+      addLog('✅ WAV result: ' + result);
+    } catch (error) {
+      addLog('❌ WAV failed: ' + JSON.stringify(error));
+    }
+  };
+
   return (
     <ScrollView style={styles.container}>
       <View style={styles.header}>
@@ -95,6 +106,16 @@ export function AudioTest() {
           }}
           color="#FF3B30"
         />
+      </View>
+
+      {/* ✅ WAV Test Button */}
+      <View style={styles.buttons}>
+        <TouchableOpacity 
+          style={styles.wavButton}
+          onPress={handlePlayWAV}
+        >
+          <Text style={styles.wavButtonText}>🧪 Test WAV Audio</Text>
+        </TouchableOpacity>
       </View>
 
       <View style={styles.logs}>
@@ -129,6 +150,19 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 12,
     marginBottom: 20,
+  },
+  wavButton: {
+    flex: 1,
+    backgroundColor: '#FF6B6B',
+    padding: 12,
+    borderRadius: 8,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  wavButtonText: {
+    color: 'white',
+    fontWeight: 'bold',
+    fontSize: 14,
   },
   logs: {
     backgroundColor: '#fff',

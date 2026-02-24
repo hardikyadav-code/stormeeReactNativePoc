@@ -1,25 +1,23 @@
+#import <Foundation/Foundation.h>
 #import <React/RCTBridgeModule.h>
 
-@interface RCT_EXTERN_MODULE(StormeeAudioBridge, NSObject)
+@interface RCT_EXTERN_MODULE(StormeeAudioModule, NSObject)
 
-RCT_EXTERN_METHOD(initialize:(NSDictionary *)config
+RCT_EXTERN_METHOD(initialize:
+                  (RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
+
+RCT_EXTERN_METHOD(writeAudioFrame:
+                  (NSString *)base64Data
                   resolver:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
 
-RCT_EXTERN_METHOD(startPlayback:(RCTPromiseResolveBlock)resolve
+RCT_EXTERN_METHOD(playWAVFile:
+                  (RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
 
-RCT_EXTERN_METHOD(stopPlayback:(RCTPromiseResolveBlock)resolve
-                  rejecter:(RCTPromiseRejectBlock)reject)
-
-RCT_EXTERN_METHOD(writeAudioFrame:(NSString *)base64Data
-                  resolver:(RCTPromiseResolveBlock)resolve
-                  rejecter:(RCTPromiseRejectBlock)reject)
-
-RCT_EXTERN_METHOD(getPlaybackMetrics:(RCTPromiseResolveBlock)resolve
-                  rejecter:(RCTPromiseRejectBlock)reject)
-
-RCT_EXTERN_METHOD(terminate:(RCTPromiseResolveBlock)resolve
+RCT_EXTERN_METHOD(stop:
+                  (RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
 
 @end

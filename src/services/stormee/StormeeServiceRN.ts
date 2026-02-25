@@ -28,30 +28,6 @@ type EventHandlers = {
   onChunkProcessed?: (chunk: any) => void;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// WIRE FORMAT (from backend Python source):
-//
-//   token_id, binary_data = data
-//   combined = b'\x92' + msgpack.packb(token_id) + binary_data
-//
-// binary_data is itself a msgpack-encoded dict:
-//   {
-//     "chunk_number":   <int>,
-//     "transcription":  <str>,   ← TTS speech text
-//     "audio_data":     <bin>,   ← raw Opus packet
-//     "isEnd":          <bool>,
-//     "header_message": <str>,
-//     "custom_content": <any>,
-//   }
-//
-// Full parse result: [ token_id_str, { audio_data: Uint8Array, ... } ]
-//
-// HERMES NOTE:
-//   React Native's Hermes engine returns Uint8Array from buf.subarray() but
-//   Object.keys(Uint8Array) === [] — it does NOT enumerate array indices.
-//   The ONLY reliable extraction method is: v.length + v[i] index access.
-// ─────────────────────────────────────────────────────────────────────────────
-
 // ── Hermes-safe binary extraction ────────────────────────────────────────────
 function extractBytes(v: unknown): Uint8Array | null {
   if (v == null) return null;
@@ -180,83 +156,6 @@ function parseMsgpack(buf: Uint8Array, offset: number): Parsed {
 
     default: throw new Error(`Unknown msgpack type 0x${t.toString(16)} at offset ${offset-1}`);
   }
-}
-
-// ── Parse one binary WebSocket frame ─────────────────────────────────────────
-interface ChunkResult {
-  tokenId:       string;
-  opusBytes:     Uint8Array | null;
-  transcription: string | null;
-  chunkNumber:   number | null;
-  isEnd:         boolean;
-  headerMessage: string | null;
-}
-
-function parseFrame(raw: Uint8Array): ChunkResult {
-  const result: ChunkResult = {
-    tokenId: "", opusBytes: null,
-    transcription: null, chunkNumber: null,
-    isEnd: false, headerMessage: null,
-  };
-
-  try {
-    // Parse the full frame as msgpack — gives [token_id, {audio_data, ...}]
-    const parsed = parseMsgpack(raw, 0);
-    const arr = parsed.value as MsgVal[];
-
-    if (!Array.isArray(arr) || arr.length < 2) {
-      console.warn("⚠️ Frame root not array(2)");
-      return result;
-    }
-
-    // ── Element 0: resumption token ───────────────────────────────────────
-    if (typeof arr[0] === "string") {
-      result.tokenId = arr[0];
-    } else {
-      const tb = extractBytes(arr[0]);
-      if (tb) result.tokenId = Buffer.from(tb).toString("utf8");
-    }
-
-    // ── Element 1: metadata dict ──────────────────────────────────────────
-    const meta = arr[1] as Record<string, MsgVal>;
-    if (typeof meta !== "object" || meta === null || Array.isArray(meta)) {
-      console.warn("⚠️ Element 1 not a dict");
-      return result;
-    }
-
-    console.log(`📦 token="${result.tokenId}" keys=[${Object.keys(meta).join(", ")}]`);
-
-    if (typeof meta["chunk_number"] === "number") result.chunkNumber = meta["chunk_number"] as number;
-    if (meta["isEnd"] === true)                   result.isEnd = true;
-
-    const hm = meta["header_message"];
-    if (typeof hm === "string" && hm.trim()) result.headerMessage = hm.trim();
-
-    const tx = meta["transcription"];
-    if (typeof tx === "string" && tx.trim()) result.transcription = tx.trim();
-
-    // ── audio_data → Opus bytes ───────────────────────────────────────────
-    const audioRaw = meta["audio_data"];
-    if (audioRaw == null) {
-      console.warn("⚠️ audio_data missing");
-      return result;
-    }
-
-    console.log(`🔍 audio_data typeof="${typeof audioRaw}" .length=${(audioRaw as any)?.length ?? "?"}`);
-
-    const bytes = extractBytes(audioRaw);
-    if (bytes && bytes.length > 0) {
-      result.opusBytes = bytes;
-      console.log(`✅ audio_data → ${bytes.length} Opus bytes | first=0x${bytes[0].toString(16)}`);
-    } else {
-      console.warn(`⚠️ extractBytes returned null — raw: ${JSON.stringify(audioRaw).slice(0, 120)}`);
-    }
-
-  } catch (err) {
-    console.error("❌ parseFrame error:", err);
-  }
-
-  return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -431,12 +330,77 @@ class StormeeServiceRN {
   // ── Message handler ───────────────────────────────────────────────────────
   private async handleMessage(event: any) {
     if (!event.data) return;
+    
     try {
       if (event.data instanceof ArrayBuffer) {
-        if (!this.isUserStopped) await this.processFrame(event.data);
+        if (this.isUserStopped) return;
+
+        const payload = new Uint8Array(event.data);
+
+        // Skip empty keep-alive frames
+        if (payload.length === 0) {
+            console.log("⏭️ Empty binary frame — skip");
+            return;
+        }
+
+        try {
+          // Unpack the MessagePack envelope
+          const parsed = parseMsgpack(payload, 0);
+          const tokenId = parsed.value[0];
+          const chunkObject = parsed.value[1];
+
+          if (chunkObject) {
+            this.chunkCounter++;
+
+            // ACK immediately
+            if (tokenId) {
+                const tokenStr = typeof tokenId === "string" ? tokenId : Buffer.from(tokenId).toString("utf8");
+                this.sendAck(tokenStr);
+            }
+
+            // 🎯 Handle Transcription
+            if (chunkObject.transcription) {
+              const tx = chunkObject.transcription;
+              const internal = tx.startsWith("{") ||
+                               tx.includes("<cognitive_reasoning>") ||
+                               tx.includes("<answerExample");
+              if (!internal) {
+                console.log(`📝 [${this.chunkCounter}] Transcription:`, tx);
+                this.handlers.onTranscription?.(tx, this.chunkCounter);
+              }
+            }
+
+            if (chunkObject.header_message) {
+                this.handlers.onHeaderMessage?.(chunkObject.header_message);
+            }
+
+            // 🚀 EXTRACT PURE OPUS USING HERMES-SAFE EXTRACTOR
+            if (chunkObject.audio_data) {
+              const pureOpusChunk = extractBytes(chunkObject.audio_data);
+              
+              if (pureOpusChunk && pureOpusChunk.length > 0) {
+                 await this.processPureAudioFrame(pureOpusChunk);
+              } else {
+                 console.log(`⚠️ [${this.chunkCounter}] Audio data exists but extractBytes failed.`);
+              }
+            }
+
+            // 🎯 Handle Stream End
+            if (chunkObject.isEnd) {
+              console.log('[🏁 Stormee] Stream ended');
+              this.handlers.onStreamEnd?.();
+            }
+          }
+        } catch (unpackError) {
+          console.error("🚨 Failed to unpack MessagePack:", unpackError);
+        }
+
       } else if (typeof event.data === "string") {
-        try { await this.processJSON(JSON.parse(event.data)); }
-        catch { console.warn("⚠️ Non-JSON:", (event.data as string).slice(0, 80)); }
+        try { 
+          await this.processJSON(JSON.parse(event.data)); 
+        } catch { 
+          console.warn("⚠️ Non-JSON:", (event.data as string).slice(0, 80)); 
+        }
       }
     } catch (err) {
       console.error("🚨 handleMessage:", err);
@@ -444,59 +408,13 @@ class StormeeServiceRN {
     }
   }
 
-  // ── Process binary frame ──────────────────────────────────────────────────
-  private async processFrame(data: ArrayBuffer) {
-    this.chunkCounter++;
-    const raw = new Uint8Array(data);
-
-    if (raw.length === 0) {
-      console.log(`⏭️  #${this.chunkCounter} empty — skip`);
-      return;
-    }
-
-    // First chunk is always a config/handshake packet with no audio
-    if (this.chunkCounter === 1) {
-      console.log(`⏭️  #1 config (${raw.length}B) — skip`);
-      return;
-    }
-
-    if (this.chunkCounter === 2) {
-      const hex = Array.from(raw.slice(0, 32)).map(b => b.toString(16).padStart(2,"0")).join(" ");
-      console.log(`🔬 #2 header bytes: ${hex}`);
-    }
-
-    // Parse the msgpack frame → { tokenId, opusBytes, transcription, ... }
-    const frame = parseFrame(raw);
-
-    // ACK immediately — backend stops sending without this
-    if (frame.tokenId) this.sendAck(frame.tokenId);
-
-    // Transcription (filter internal metadata strings)
-    if (frame.transcription) {
-      const tx = frame.transcription;
-      const internal = tx.startsWith("{") ||
-                       tx.includes("<cognitive_reasoning>") ||
-                       tx.includes("<answerExample");
-      if (!internal) {
-        console.log(`📝 "${tx.slice(0, 80)}"`);
-        this.handlers.onTranscription?.(tx, frame.chunkNumber ?? this.chunkCounter);
-      }
-    }
-
-    if (frame.headerMessage) this.handlers.onHeaderMessage?.(frame.headerMessage);
-
-    // No audio this frame — skip
-    if (!frame.opusBytes || frame.opusBytes.length === 0) {
-      console.log(`⏭️  #${this.chunkCounter} no audio`);
-      return;
-    }
-
-    const opus = frame.opusBytes;
-    const toc  = opus[0];
-    console.log(`🎵 #${this.chunkCounter}: ${raw.length}B → ${opus.length}B Opus | TOC=0x${toc.toString(16)} config=${toc>>3} mono=${((toc>>2)&1)===0}`);
+  // ── Process Pure Audio Frame ──────────────────────────────────────────────────
+  private async processPureAudioFrame(opusBytes: Uint8Array) {
+    const toc = opusBytes[0];
+    console.log(`🎵 #${this.chunkCounter}: ${opusBytes.length}B Opus | TOC=0x${toc.toString(16)}`);
 
     // Encode for native bridge
-    const b64 = Buffer.from(opus).toString("base64");
+    const b64 = Buffer.from(opusBytes).toString("base64");
 
     // Queue ensures sequential playback even under async native calls
     this.playbackQueue = this.playbackQueue.then(async () => {
@@ -508,8 +426,8 @@ class StormeeServiceRN {
       }
     });
 
-    this.handlers.onAudioChunk?.(opus, this.chunkCounter);
-    this.handlers.onChunkProcessed?.({ chunkNumber: this.chunkCounter, size: opus.length });
+    this.handlers.onAudioChunk?.(opusBytes, this.chunkCounter);
+    this.handlers.onChunkProcessed?.({ chunkNumber: this.chunkCounter, size: opusBytes.length });
   }
 
   // ── Process JSON control messages ─────────────────────────────────────────

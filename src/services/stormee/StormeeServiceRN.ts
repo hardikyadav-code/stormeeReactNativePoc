@@ -234,7 +234,7 @@ class StormeeServiceRN {
   private connectReject:  ((e: any) => void) | null = null;
   private playbackQueue: Promise<void> = Promise.resolve();
 
-  private readonly WS_BASE_URL = "wss://s3j72d57-8000.inc1.devtunnels.ms/stormee-asgi-server/ws";
+  private readonly WS_BASE_URL = "wss://devllmstudio.creativeworkspace.ai/stormee-asgi-server/ws";
 
   setEventHandlers(h: EventHandlers) { this.handlers = h; }
 
@@ -327,7 +327,7 @@ class StormeeServiceRN {
     this.playbackQueue = Promise.resolve();
 
     const payload = {
-      concierge_name: "abhiramstormee",
+      concierge_name: "stormee",
       request_id:     `requestId-${this.generateUUID()}`,
       agent_arguments: { user_query: userQuery },
       chat_history:   [],

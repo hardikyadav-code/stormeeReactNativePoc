@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import {
   Modal,
   View,
@@ -7,9 +7,12 @@ import {
   Text,
   Pressable,
   StyleSheet,
+  TextInput,
+  KeyboardAvoidingView,
+  Platform,
 } from "react-native";
 import { useStormeeRN } from "../services/stormee/useStormeeRN";
-import StormeeServiceRN from "../services/stormee/StormeeServiceRN";
+import { useChatHistoryStore } from "../store/useChatHistoryStore";
 
 type StormeeModalProps = {
   visible: boolean;
@@ -17,55 +20,82 @@ type StormeeModalProps = {
 };
 
 const StormeeModal = ({ visible, onClose }: StormeeModalProps) => {
-  const { transcription, connected, send  } = useStormeeRN(visible);
-  
+  const { transcription, connected, send } = useStormeeRN(visible);
+
+  const [input, setInput] = useState("");
+  const istThinking = useChatHistoryStore((state) => state.isStormeeThinking);
+
+  useEffect(() => {
+    if (connected) {
+      send("Hello Stormee!");
+      useChatHistoryStore.getState().setIsStormeeThinking(true);
+    }
+  }, [connected]);
+
+  const handleSend = async () => {
+    if (!input.trim()) return;
+
+    await send(input.trim());
+    setInput("");
+  };
 
   return (
     <Modal visible={visible} animationType="slide" presentationStyle="pageSheet">
-      <SafeAreaView style={styles.container}>
-        {/* HEADER */}
-        <View style={styles.header}>
-          <View style={styles.headerLeft}>
-            <Image
-              source={{
-                uri: "https://cdn-icons-png.flaticon.com/512/4712/4712109.png",
-              }}
-              style={styles.logo}
-            />
-            <Text style={styles.headerTitle}>Stormee</Text>
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+      >
+        <SafeAreaView style={styles.container}>
+          {/* HEADER */}
+          <View style={styles.header}>
+            <View style={styles.headerLeft}>
+              <Image
+                source={{
+                  uri: "https://cdn-icons-png.flaticon.com/512/4712/4712109.png",
+                }}
+                style={styles.logo}
+              />
+              <Text style={styles.headerTitle}>Stormee</Text>
+            </View>
+
+            <Pressable onPress={onClose} style={styles.closeBtn}>
+              <Text style={styles.closeBtnText}>✕</Text>
+            </Pressable>
           </View>
 
-          <Pressable onPress={onClose} style={styles.closeBtn}>
-            <Text style={styles.closeBtnText}>✕</Text>
-          </Pressable>
-        </View>
+          {/* BODY */}
+          <View style={styles.body}>
+            {/* <Text style={styles.connectionText}>
+              {connected ? "Connected ✅" : "Disconnected ❌"}
+            </Text> */}
 
-        {/* BODY */}
-        <View style={styles.body}>
-          <Text style={styles.connectionText}>
-            {connected ? "Connected ✅" : "Disconnected ❌"}
-          </Text>
-
-          <View style={styles.transcriptionBox}>
-            <Text style={styles.transcriptionText}>
-              {transcription || "No transcription yet..."}
-            </Text>
+            <View style={styles.transcriptionBox}>
+              <Text style={styles.transcriptionText}>
+                {istThinking ? "Stormee is thinking..." : transcription}
+              </Text>
+            </View>
           </View>
-        </View>
-        <Pressable style={styles.sendBtn}>
-  <Text style={styles.sendBtnText}>▶ Play Chunks</Text>
-</Pressable>
 
-        {/* FOOTER */}
-        <View style={styles.footer}>
-          <Pressable
-            onPress={() => send("Hello Stormee")}
-            style={styles.sendBtn}
-          >
-            <Text style={styles.sendBtnText}>Send Test</Text>
-          </Pressable>
-        </View>
-      </SafeAreaView>
+          {/* FOOTER INPUT */}
+          <View style={styles.footer}>
+            <View style={styles.inputContainer}>
+              <TextInput
+                value={input}
+                onChangeText={setInput}
+                placeholder="Type your message..."
+                placeholderTextColor="#6b7280"
+                style={styles.input}
+                onSubmitEditing={handleSend}
+                returnKeyType="send"
+              />
+
+              <Pressable style={styles.sendBtn} onPress={handleSend}>
+                <Text style={styles.sendBtnText}>Send</Text>
+              </Pressable>
+            </View>
+          </View>
+        </SafeAreaView>
+      </KeyboardAvoidingView>
     </Modal>
   );
 };
@@ -147,16 +177,33 @@ const styles = StyleSheet.create({
   },
 
   footer: {
-    height: 72,
     borderTopWidth: 1,
     borderTopColor: "#1f2937",
-    paddingHorizontal: 16,
-    justifyContent: "center",
+    padding: 12,
+    backgroundColor: "#0b0b0f",
+  },
+
+  inputContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+
+  input: {
+    flex: 1,
+    height: 44,
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    backgroundColor: "#111827",
+    color: "#fff",
+    borderWidth: 1,
+    borderColor: "#1f2937",
   },
 
   sendBtn: {
     height: 44,
-    borderRadius: 14,
+    paddingHorizontal: 18,
+    borderRadius: 12,
     backgroundColor: "#2563eb",
     justifyContent: "center",
     alignItems: "center",
@@ -164,7 +211,7 @@ const styles = StyleSheet.create({
 
   sendBtnText: {
     color: "#fff",
-    fontSize: 16,
+    fontSize: 14,
     fontWeight: "700",
   },
 });

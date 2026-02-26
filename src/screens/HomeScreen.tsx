@@ -3,6 +3,7 @@ import { Pressable, Text , View , StyleSheet } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import StormeeModal from "./StormeeModal";
 
+
 const HomeScreen = () => {
     const [isModal , setIsModal] = useState(false);
     return (
@@ -11,7 +12,9 @@ const HomeScreen = () => {
             <Text>Stormee</Text>
             <Pressable 
                 style={styles.button}
-                onPress={() => setIsModal(true)}
+                onPress={() => {
+                  setIsModal(true);
+                }}
             >
                 <Text style={styles.buttonText}>Open Stormee Assistant</Text>
             </Pressable>

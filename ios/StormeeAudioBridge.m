@@ -23,5 +23,9 @@ RCT_EXTERN_METHOD(playWAVFile:
 RCT_EXTERN_METHOD(stop:
                   (RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
+// 👇 ADD THIS NEW LINE RIGHT HERE:
+RCT_EXTERN_METHOD(processAccumulatedAudio:
+                  (RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
 
 @end

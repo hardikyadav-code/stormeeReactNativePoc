@@ -28,65 +28,64 @@ type EventHandlers = {
   onChunkProcessed?: (chunk: any) => void;
 };
 
-// ── Hermes-safe binary extraction ────────────────────────────────────────────
-function extractBytes(v: unknown): Uint8Array | null {
-  if (v == null) return null;
+// ── NEW: Robust Extractor that pulls EVERY frame from the backend array ──────
+function extractAllBytes(v: unknown): Uint8Array[] {
+  if (v == null) return [];
 
-  // Already a proper typed array
-  if (v instanceof Uint8Array) return v.length > 0 ? v : null;
+  if (v instanceof Uint8Array) return v.length > 0 ? [v] : [];
   if (ArrayBuffer.isView(v)) {
     const b = v as ArrayBufferView;
-    return b.byteLength > 0 ? new Uint8Array(b.buffer, b.byteOffset, b.byteLength) : null;
+    return b.byteLength > 0 ? [new Uint8Array(b.buffer, b.byteOffset, b.byteLength)] : [];
   }
 
-  // Base64 string
   if (typeof v === "string") {
-    if (!v.length) return null;
+    if (!v.length) return [];
     try {
       const d = Buffer.from(v, "base64");
-      return d.length > 0 ? new Uint8Array(d) : null;
-    } catch { return null; }
+      return d.length > 0 ? [new Uint8Array(d)] : [];
+    } catch { return []; }
   }
 
   if (typeof v === "object") {
-    // Array of numbers or array wrapping a typed array
-    if (Array.isArray(v)) {
-      if (!v.length) return null;
-      if (typeof v[0] === "number") return new Uint8Array(v as number[]);
-      // Array wrapping one binary value: [Uint8Array(N)]
-      for (const el of v) {
-        const inner = extractBytes(el);
-        if (inner) return inner;
-      }
-      return null;
-    }
-
-    // KEY FIX FOR HERMES:
-    // Object.keys(Uint8Array) returns [] in Hermes — useless.
-    // But .length and v[i] always work on any array-like object including Uint8Array.
     const obj = v as any;
-    if (typeof obj.length === "number" && obj.length > 0) {
-      if (typeof obj[0] === "number") {
-        const bytes = new Uint8Array(obj.length);
-        for (let i = 0; i < obj.length; i++) bytes[i] = obj[i] ?? 0;
-        return bytes;
-      }
-      // length > 0 but first element isn't a number — try recursing on element 0
-      const inner = extractBytes(obj[0]);
-      if (inner) return inner;
+
+    // 1. Is it a single buffer? (Array of numbers)
+    if (Array.isArray(v) && v.length > 0 && typeof v[0] === "number") {
+      return [new Uint8Array(v as number[])];
+    }
+    if (typeof obj.length === "number" && obj.length > 0 && typeof obj[0] === "number") {
+      const bytes = new Uint8Array(obj.length);
+      for (let i = 0; i < obj.length; i++) bytes[i] = obj[i] ?? 0;
+      return [bytes];
     }
 
-    // Last resort: plain object with numeric string keys {"0":104,"1":11,...}
-    const keys = Object.keys(obj).filter(k => !isNaN(Number(k)))
-                                  .sort((a, b) => Number(a) - Number(b));
+    // 2. Is it a LIST of buffers? (Backend array of frames)
+    if (Array.isArray(v)) {
+      const results: Uint8Array[] = [];
+      for (const el of v) results.push(...extractAllBytes(el));
+      return results;
+    }
+    if (typeof obj.length === "number" && obj.length > 0) {
+      const results: Uint8Array[] = [];
+      for (let i = 0; i < obj.length; i++) results.push(...extractAllBytes(obj[i]));
+      return results;
+    }
+
+    // 3. Hermes dict fallback
+    const keys = Object.keys(obj).filter(k => !isNaN(Number(k))).sort((a, b) => Number(a) - Number(b));
     if (keys.length > 0) {
-      const bytes = new Uint8Array(keys.length);
-      for (let i = 0; i < keys.length; i++) bytes[i] = obj[keys[i]] ?? 0;
-      return bytes;
+      if (typeof obj[keys[0]] === "number") {
+         const bytes = new Uint8Array(keys.length);
+         for (let i = 0; i < keys.length; i++) bytes[i] = obj[keys[i]] ?? 0;
+         return [bytes];
+      }
+      const results: Uint8Array[] = [];
+      for (let i = 0; i < keys.length; i++) results.push(...extractAllBytes(obj[keys[i]]));
+      return results;
     }
   }
 
-  return null;
+  return [];
 }
 
 // ── Minimal msgpack parser ────────────────────────────────────────────────────
@@ -98,10 +97,10 @@ function parseMsgpack(buf: Uint8Array, offset: number): Parsed {
   if (offset >= buf.length) throw new Error(`msgpack offset ${offset} out of bounds`);
   const t = buf[offset++];
 
-  if ((t & 0x80) === 0x00) return { value: t, offset };           // pos fixint
-  if ((t & 0xe0) === 0xe0) return { value: t - 256, offset };      // neg fixint
+  if ((t & 0x80) === 0x00) return { value: t, offset };           
+  if ((t & 0xe0) === 0xe0) return { value: t - 256, offset };      
 
-  if ((t & 0xf0) === 0x80) {                                        // fixmap
+  if ((t & 0xf0) === 0x80) {                                        
     const n = t & 0x0f;
     const map: Record<string, MsgVal> = {};
     for (let i = 0; i < n; i++) {
@@ -112,7 +111,7 @@ function parseMsgpack(buf: Uint8Array, offset: number): Parsed {
     return { value: map, offset };
   }
 
-  if ((t & 0xf0) === 0x90) {                                        // fixarray
+  if ((t & 0xf0) === 0x90) {                                        
     const n = t & 0x0f;
     const arr: MsgVal[] = [];
     for (let i = 0; i < n; i++) {
@@ -122,7 +121,7 @@ function parseMsgpack(buf: Uint8Array, offset: number): Parsed {
     return { value: arr, offset };
   }
 
-  if ((t & 0xe0) === 0xa0) {                                        // fixstr
+  if ((t & 0xe0) === 0xa0) {                                        
     const n = t & 0x1f;
     return { value: Buffer.from(buf.subarray(offset, offset + n)).toString("utf8"), offset: offset + n };
   }
@@ -158,6 +157,63 @@ function parseMsgpack(buf: Uint8Array, offset: number): Parsed {
   }
 }
 
+// ── Parse one binary WebSocket frame ─────────────────────────────────────────
+interface ChunkResult {
+  tokenId:       string;
+  opusBytesArray: Uint8Array[]; // 🚀 Now supports arrays of frames!
+  transcription: string | null;
+  chunkNumber:   number | null;
+  isEnd:         boolean;
+  headerMessage: string | null;
+}
+
+function parseFrame(raw: Uint8Array): ChunkResult {
+  const result: ChunkResult = {
+    tokenId: "", opusBytesArray: [],
+    transcription: null, chunkNumber: null,
+    isEnd: false, headerMessage: null,
+  };
+
+  try {
+    const parsed = parseMsgpack(raw, 0);
+    const arr = parsed.value as MsgVal[];
+
+    if (!Array.isArray(arr) || arr.length < 2) return result;
+
+    if (typeof arr[0] === "string") {
+      result.tokenId = arr[0];
+    } else {
+      const tb = extractAllBytes(arr[0]);
+      if (tb.length > 0) result.tokenId = Buffer.from(tb[0]).toString("utf8");
+    }
+
+    const meta = arr[1] as Record<string, MsgVal>;
+    if (typeof meta !== "object" || meta === null || Array.isArray(meta)) return result;
+
+    if (typeof meta["chunk_number"] === "number") result.chunkNumber = meta["chunk_number"] as number;
+    if (meta["isEnd"] === true) result.isEnd = true;
+
+    const hm = meta["header_message"];
+    if (typeof hm === "string" && hm.trim()) result.headerMessage = hm.trim();
+
+    const tx = meta["transcription"];
+    if (typeof tx === "string" && tx.trim()) result.transcription = tx.trim();
+
+    const audioRaw = meta["audio_data"];
+    if (audioRaw != null) {
+      const bytesArray = extractAllBytes(audioRaw);
+      if (bytesArray.length > 0) {
+        result.opusBytesArray = bytesArray;
+      }
+    }
+
+  } catch (err) {
+    console.error("❌ parseFrame error:", err);
+  }
+
+  return result;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SERVICE
 // ─────────────────────────────────────────────────────────────────────────────
@@ -190,14 +246,10 @@ class StormeeServiceRN {
 
   getState() { return this.state; }
 
-  // ── Connect ───────────────────────────────────────────────────────────────
   connect(sessionId: string): Promise<void> {
-    if (this.isConnected && this.pendingSessionId === sessionId && this.socket) {
-      return Promise.resolve();
-    }
+    if (this.isConnected && this.pendingSessionId === sessionId && this.socket) return Promise.resolve();
     return new Promise((resolve, reject) => {
       this.pendingSessionId = sessionId;
-      console.log(`🔌 Connecting: ${this.WS_BASE_URL}/${sessionId}`);
       this.state            = StreamingState.CONNECTING;
       this.connectResolve   = resolve;
       this.connectReject    = reject;
@@ -207,8 +259,6 @@ class StormeeServiceRN {
       this.playbackQueue    = Promise.resolve();
 
       if (this.socket) {
-        this.socket.onopen = this.socket.onmessage =
-        this.socket.onerror = this.socket.onclose = null;
         this.socket.close();
         this.socket = null;
       }
@@ -219,7 +269,6 @@ class StormeeServiceRN {
         this.socket = ws;
 
         ws.onopen = () => {
-          console.log("✅ WebSocket open");
           this.isConnected = true;
           this.state       = StreamingState.CONNECTED;
           this.reconnectAttempts = 0;
@@ -231,7 +280,6 @@ class StormeeServiceRN {
         ws.onmessage = async (e: any) => { await this.handleMessage(e); };
 
         ws.onerror = (err: any) => {
-          console.error("🚨 WS error:", err);
           this.state = StreamingState.ERROR;
           this.connectReject?.(err);
           this.connectResolve = this.connectReject = null;
@@ -239,16 +287,13 @@ class StormeeServiceRN {
         };
 
         ws.onclose = (e: any) => {
-          console.log(`❌ WS closed code=${e.code}`);
           this.isConnected = false;
-          this.connectReject?.(new Error(`WS closed before open (code=${e.code})`));
+          this.connectReject?.(new Error(`WS closed`));
           this.connectResolve = this.connectReject = null;
 
           if (!this.isUserStopped && this.reconnectAttempts < this.maxReconnectAttempts) {
             this.reconnectAttempts++;
-            const delay = Math.min(this.reconnectDelay * this.reconnectAttempts, 10000);
-            this.state = StreamingState.RECONNECTING;
-            setTimeout(() => this.connect(this.pendingSessionId).catch(console.error), delay);
+            setTimeout(() => this.connect(this.pendingSessionId).catch(console.error), 1000);
           } else {
             this.state = StreamingState.IDLE;
             this.handlers.onDisconnect?.();
@@ -258,19 +303,13 @@ class StormeeServiceRN {
         this.state = StreamingState.ERROR;
         this.connectResolve = this.connectReject = null;
         reject(err);
-        this.handlers.onError?.(err);
       }
     });
   }
 
-  // ── Disconnect ────────────────────────────────────────────────────────────
   disconnect() {
     this.isUserStopped = true;
-    this.connectReject?.(new Error("User disconnected"));
-    this.connectResolve = this.connectReject = null;
     if (this.socket) {
-      this.socket.onopen = this.socket.onmessage =
-      this.socket.onerror = this.socket.onclose = null;
       this.socket.close();
       this.socket = null;
     }
@@ -279,9 +318,8 @@ class StormeeServiceRN {
     this.handlers.onDisconnect?.();
   }
 
-  // ── Send query ────────────────────────────────────────────────────────────
   sendInitWithQuery(userQuery: string) {
-    if (!this.socket || !this.isConnected) { console.error("❌ Not connected"); return; }
+    if (!this.socket || !this.isConnected) return;
 
     this.state         = StreamingState.STREAMING;
     this.isUserStopped = false;
@@ -311,22 +349,17 @@ class StormeeServiceRN {
 
     try {
       this.socket.send(JSON.stringify(payload));
-      console.log("✅ Query sent");
     } catch (err) {
-      console.error("❌ Send failed:", err);
       this.state = StreamingState.ERROR;
       this.handlers.onError?.(err);
     }
   }
 
-  // ── Send ACK (required — backend uses for flow control) ──────────────────
   private sendAck(tokenId: string) {
     if (!this.socket || !this.isConnected || !tokenId) return;
-    try { this.socket.send(JSON.stringify({ ack: tokenId })); }
-    catch (err) { console.warn("⚠️ ACK failed:", err); }
+    try { this.socket.send(JSON.stringify({ ack: tokenId })); } catch (err) {}
   }
 
-  // ── Message handler ───────────────────────────────────────────────────────
   private async handleMessage(event: any) {
     if (!event.data) return;
     
@@ -335,15 +368,9 @@ class StormeeServiceRN {
         if (this.isUserStopped) return;
 
         const payload = new Uint8Array(event.data);
-
-        // Skip empty keep-alive frames
-        if (payload.length === 0) {
-            console.log("⏭️ Empty binary frame — skip");
-            return;
-        }
+        if (payload.length === 0) return;
 
         try {
-          // Unpack the MessagePack envelope
           const parsed = parseMsgpack(payload, 0);
           const tokenId = parsed.value[0];
           const chunkObject = parsed.value[1];
@@ -351,42 +378,36 @@ class StormeeServiceRN {
           if (chunkObject) {
             this.chunkCounter++;
 
-            // ACK immediately
             if (tokenId) {
                 const tokenStr = typeof tokenId === "string" ? tokenId : Buffer.from(tokenId).toString("utf8");
                 this.sendAck(tokenStr);
             }
 
-            // 🎯 Handle Transcription
             if (chunkObject.transcription) {
               const tx = chunkObject.transcription;
-              const internal = tx.startsWith("{") ||
-                               tx.includes("<cognitive_reasoning>") ||
-                               tx.includes("<answerExample");
-              if (!internal) {
-                console.log(`📝 [${this.chunkCounter}] Transcription:`, tx);
+              if (!tx.startsWith("{") && !tx.includes("<cognitive")) {
                 this.handlers.onTranscription?.(tx, this.chunkCounter);
               }
             }
 
-            if (chunkObject.header_message) {
-                this.handlers.onHeaderMessage?.(chunkObject.header_message);
-            }
-
-            // 🚀 EXTRACT PURE OPUS USING HERMES-SAFE EXTRACTOR
+            // 🚀 THE FIX: Loop through ALL frames in the array and process them!
             if (chunkObject.audio_data) {
-              const pureOpusChunk = extractBytes(chunkObject.audio_data);
+              const frames = extractAllBytes(chunkObject.audio_data);
               
-              if (pureOpusChunk && pureOpusChunk.length > 0) {
-                 await this.processPureAudioFrame(pureOpusChunk);
-              } else {
-                 console.log(`⚠️ [${this.chunkCounter}] Audio data exists but extractBytes failed.`);
+              if (frames.length > 0) {
+                 console.log(`📦 Unpacked ${frames.length} Opus frames from chunk #${this.chunkCounter}!`);
+                 for (const frame of frames) {
+                    await this.processPureAudioFrame(frame);
+                 }
               }
             }
 
-            // 🎯 Handle Stream End
             if (chunkObject.isEnd) {
-              console.log('[🏁 Stormee] Stream ended');
+              this.playbackQueue = this.playbackQueue.then(async () => {
+                try {
+                  await StormeeAudioModule.processAccumulatedAudio();
+                } catch (err) {}
+              });
               this.handlers.onStreamEnd?.();
             }
           }
@@ -395,43 +416,25 @@ class StormeeServiceRN {
         }
 
       } else if (typeof event.data === "string") {
-        try { 
-          await this.processJSON(JSON.parse(event.data)); 
-        } catch { 
-          console.warn("⚠️ Non-JSON:", (event.data as string).slice(0, 80)); 
-        }
+        try { await this.processJSON(JSON.parse(event.data)); } catch {}
       }
     } catch (err) {
-      console.error("🚨 handleMessage:", err);
       this.handlers.onError?.(err);
     }
   }
 
-  // ── Process Pure Audio Frame ──────────────────────────────────────────────────
   private async processPureAudioFrame(opusBytes: Uint8Array) {
-    const toc = opusBytes[0];
-    console.log(`🎵 #${this.chunkCounter}: ${opusBytes.length}B Opus | TOC=0x${toc.toString(16)}`);
-
-    // Encode for native bridge
     const b64 = Buffer.from(opusBytes).toString("base64");
-
-    // Queue ensures sequential playback even under async native calls
     this.playbackQueue = this.playbackQueue.then(async () => {
       try {
-        const result = await StormeeAudioModule.writeAudioFrame(b64);
-        console.log(`✅ #${this.chunkCounter} played: ${result}`);
-      } catch (err) {
-        console.error(`❌ #${this.chunkCounter} native error:`, err);
-      }
+        await StormeeAudioModule.writeAudioFrame(b64);
+      } catch (err) {}
     });
-
     this.handlers.onAudioChunk?.(opusBytes, this.chunkCounter);
-    this.handlers.onChunkProcessed?.({ chunkNumber: this.chunkCounter, size: opusBytes.length });
   }
 
-  // ── Process JSON control messages ─────────────────────────────────────────
   private async processJSON(data: any) {
-    if (data.ack) return; // ack echo from server — ignore
+    if (data.ack) return; 
 
     switch (data.type) {
       case "stream_started":
@@ -441,12 +444,10 @@ class StormeeServiceRN {
         break;
       case "stream_stopped":
         await this.playbackQueue;
-        try { await StormeeAudioModule.stop(); } catch { /* ignore */ }
         this.state = StreamingState.CONNECTED;
         this.handlers.onStreamEnd?.();
         break;
       case "error":
-        console.error("🚨 Server error:", data.message);
         this.state = StreamingState.ERROR;
         this.handlers.onError?.(new Error(data.message || "Server error"));
         break;

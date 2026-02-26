@@ -15,19 +15,20 @@ class StormeeAudioModule: NSObject {
 
     private var engine:        AVAudioEngine?
     private var playerNode:    AVAudioPlayerNode?
-    private var opusConverter: AVAudioConverter?   // Opus compressed → PCM 24kHz
-    private var resampleConv:  AVAudioConverter?   // PCM 24kHz → PCM hardware rate
+    private var opusConverter: AVAudioConverter?   // Opus compressed → PCM16 24kHz
+    private var resampleConv:  AVAudioConverter?   // PCM24k → PCM hardware rate
 
-    // Opus always comes in at 24kHz mono
+    // Opus always comes in at 24kHz mono (PCM16 or Float32 output)
     private let opusPCMFormat = AVAudioFormat(
-        commonFormat: .pcmFormatFloat32,
-        sampleRate: 24000,
-        channels: 1,
-        interleaved: false
+      standardFormatWithSampleRate: 24000,
+      channels: 1
     )!
 
     // Hardware output format — set after engine starts
     private var hardwareFormat: AVAudioFormat?
+    
+    // Chunk counter for logging
+    private var decodedChunkCounter = 0
 
     // MARK: - Initialize
 
@@ -60,10 +61,8 @@ class StormeeAudioModule: NSObject {
             // must match what we feed into playerNode
             // Connect player -> mainMixer using hardware rate so no implicit conversion needed
             let scheduleFormat = AVAudioFormat(
-                commonFormat: .pcmFormatFloat32,
-                sampleRate: hwRate,
-                channels: 1,
-                interleaved: false
+              standardFormatWithSampleRate: hwRate,
+              channels: 1
             )!
             eng.connect(player, to: mainMixer, format: scheduleFormat)
 
@@ -123,7 +122,10 @@ class StormeeAudioModule: NSObject {
         }
 
         let hex = opusData.prefix(6).map { String(format: "%02x", $0) }.joined(separator: " ")
-        print("🎵 writeAudioFrame: \(opusData.count)B | [\(hex)]")
+        print("\n🎵 ───────────────────────────────────────────────────")
+        print("📥 writeAudioFrame received: \(opusData.count)B Opus")
+        print("   Hex: [\(hex)]")
+        print("─────────────────────────────────────────────────────")
 
         guard let opusConv   = opusConverter,
               let hwFmt      = hardwareFormat,
@@ -134,25 +136,40 @@ class StormeeAudioModule: NSObject {
 
         DispatchQueue.global(qos: .userInteractive).async {
             do {
-                // Step 1: Decode Opus → PCM at 24kHz
+                // ─────────────────────────────────────────────────────
+                // Step 1: Decode Opus → PCM at 24kHz in Audio Engine
+                // ─────────────────────────────────────────────────────
+                print("⚙️  Step 1: Opus → PCM24k Decoding...")
                 let pcm24k = try self.decodeOpus(opusData, converter: opusConv)
-                print("   Decoded: \(pcm24k.frameLength) frames @ 24kHz")
+                print("   ✓ Decode complete\n")
 
+                // ─────────────────────────────────────────────────────
                 // Step 2: Resample to hardware rate if needed
+                // ─────────────────────────────────────────────────────
                 let finalBuffer: AVAudioPCMBuffer
                 if let resamp = self.resampleConv {
+                    print("⚙️  Step 2: PCM24k → Hardware Rate Resampling...")
                     finalBuffer = try self.resample(pcm24k, to: hwFmt, converter: resamp)
-                    print("   Resampled: \(finalBuffer.frameLength) frames @ \(hwFmt.sampleRate)Hz")
+                    print("   ✓ Resample complete\n")
                 } else {
+                    print("⚙️  Step 2: No resampling needed (hardware is 24kHz)\n")
                     finalBuffer = pcm24k
                 }
 
+                // ─────────────────────────────────────────────────────
                 // Step 3: Schedule for playback
+                // ─────────────────────────────────────────────────────
+                print("⚙️  Step 3: Scheduling PCM buffer to player...")
                 try self.schedule(finalBuffer, player: player, engine: engine)
+                print("   ✓ Schedule complete\n")
+                
+                print("✅ AUDIO PIPELINE COMPLETE")
+                print("───────────────────────────────────────────────────\n")
+                
                 resolve("played")
 
             } catch {
-                print("❌ \(error.localizedDescription)")
+                print("❌ Pipeline Error: \(error.localizedDescription)\n")
                 reject("AUDIO_ERROR", error.localizedDescription, error)
             }
         }
@@ -163,7 +180,40 @@ class StormeeAudioModule: NSObject {
     private func decodeOpus(_ opusData: Data,
                              converter: AVAudioConverter) throws -> AVAudioPCMBuffer {
 
-        // Wrap Opus in AVAudioCompressedBuffer
+        // ─────────────────────────────────────────────────────────────────
+        // Step 1: Parse Opus TOC byte for logging/diagnostics
+        // ─────────────────────────────────────────────────────────────────
+        guard opusData.count > 0 else { throw AudioErr.emptyResult }
+        
+        let tocByte = opusData[0]
+        let frameConfig = Int((tocByte >> 3) & 0x0F)  // Bits 3-6, cast to Int
+        
+        // Calculate frame duration in milliseconds (for logging only)
+        let frameDurationMs: Int
+        switch frameConfig {
+        case 0: frameDurationMs = 10
+        case 1: frameDurationMs = 20
+        case 2: frameDurationMs = 40
+        case 3: frameDurationMs = 60
+        case 4, 5, 6, 7:
+            let base = 100 * (frameConfig - 3)
+            frameDurationMs = base
+        case 8, 9, 10, 11:
+            let base = 100 + 100 * (frameConfig - 8)
+            frameDurationMs = base
+        case 12, 13, 14, 15:
+            let base = 500 + 100 * (frameConfig - 12)
+            frameDurationMs = base
+        default:
+            frameDurationMs = 20
+        }
+        
+        let expectedFrames = (frameDurationMs * 24000) / 1000
+        print("🎯 [TOC 0x\(String(tocByte, radix: 16))] Frame config: \(frameConfig) → \(frameDurationMs)ms → \(expectedFrames) samples")
+
+        // ─────────────────────────────────────────────────────────────────
+        // Step 2: Wrap Opus in AVAudioCompressedBuffer
+        // ─────────────────────────────────────────────────────────────────
         let compBuf = AVAudioCompressedBuffer(
             format: converter.inputFormat,
             packetCapacity: 1,
@@ -183,12 +233,25 @@ class StormeeAudioModule: NSObject {
             descs[0].mVariableFramesInPacket = 0
         }
 
-        // Output PCM buffer — 960 frames = 40ms at 24kHz (safe upper bound)
+        print("📦 Compressed buffer: \(opusData.count)B wrapped")
+
+        // ─────────────────────────────────────────────────────────────────
+        // Step 3: Allocate output PCM buffer with FIXED maximum capacity
+        // 2880 frames = 120ms at 24kHz (maximum Opus frame duration)
+        // Actual decoded frame count may be less — we use actual frameLength
+        // ─────────────────────────────────────────────────────────────────
+        let maxOpusFramesAt24k: AVAudioFrameCount = 2880
+        
         guard let pcmBuf = AVAudioPCMBuffer(pcmFormat: converter.outputFormat,
-                                             frameCapacity: 960) else {
-            throw AudioErr.bufferFailed("output PCM 24kHz")
+                                             frameCapacity: maxOpusFramesAt24k) else {
+            throw AudioErr.bufferFailed("output PCM 24kHz capacity \(maxOpusFramesAt24k)")
         }
 
+        print("📋 PCM buffer allocated: fixed capacity \(maxOpusFramesAt24k) frames @ 24kHz (max 120ms)")
+
+        // ─────────────────────────────────────────────────────────────────
+        // Step 4: Decode Opus → PCM using AVAudioConverter
+        // ─────────────────────────────────────────────────────────────────
         var inputConsumed = false
         var convError: NSError?
 
@@ -199,10 +262,30 @@ class StormeeAudioModule: NSObject {
             return compBuf
         }
 
-        if let err = convError { throw AudioErr.converterFailed(err.localizedDescription) }
-        guard status != .error else { throw AudioErr.converterFailed("Opus decoder returned .error") }
-        guard pcmBuf.frameLength > 0 else { throw AudioErr.emptyResult }
+        if let err = convError { 
+            throw AudioErr.converterFailed("Opus→PCM: \(err.localizedDescription)") 
+        }
+        guard status != .error else { 
+            throw AudioErr.converterFailed("Opus decoder returned .error") 
+        }
+        guard pcmBuf.frameLength > 0 else { 
+            throw AudioErr.emptyResult 
+        }
 
+        // ─────────────────────────────────────────────────────────────────
+        // Step 5: LOG DECODED CHUNK - VERIFY CONVERSION SUCCESS
+        // ─────────────────────────────────────────────────────────────────
+        self.decodedChunkCounter += 1
+        let duration = Double(pcmBuf.frameLength) / 24000.0 * 1000.0  // ms
+        
+        print("✅ [CHUNK #\(self.decodedChunkCounter)] Opus→PCM Conversion Complete")
+        print("   ├─ Input: \(opusData.count)B Opus @ 24kHz")
+        print("   ├─ Buffer allocated: 2880 frames (fixed max)")
+        print("   ├─ Output: \(pcmBuf.frameLength) frames PCM (actual decoded)")
+        print("   ├─ Duration: \(String(format: "%.2f", duration))ms")
+        print("   ├─ Format: Float32 | Channels: 1 | Rate: 24000Hz")
+        print("   └─ Status: Ready for resampling/playback")
+        
         return pcmBuf
     }
 
@@ -214,7 +297,7 @@ class StormeeAudioModule: NSObject {
 
         // Calculate output frame count based on ratio
         let ratio      = outFmt.sampleRate / input.format.sampleRate
-        let outFrames  = AVAudioFrameCount(Double(input.frameLength) * ratio) + 64 // +64 headroom
+        let outFrames  = AVAudioFrameCount(Double(input.frameLength) * ratio) + 64
 
         guard let outBuf = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: outFrames) else {
             throw AudioErr.bufferFailed("resample output")
@@ -234,6 +317,13 @@ class StormeeAudioModule: NSObject {
         guard status != .error else { throw AudioErr.converterFailed("Resampler returned .error") }
         guard outBuf.frameLength > 0 else { throw AudioErr.emptyResult }
 
+        // Log resampling result
+        let inputDuration = Double(input.frameLength) / input.format.sampleRate * 1000.0
+        let outputDuration = Double(outBuf.frameLength) / outFmt.sampleRate * 1000.0
+        
+        print("   🔄 Resampled: \(input.frameLength)f @ \(Int(input.format.sampleRate))Hz → \(outBuf.frameLength)f @ \(Int(outFmt.sampleRate))Hz")
+        print("      Duration: \(String(format: "%.2f", inputDuration))ms → \(String(format: "%.2f", outputDuration))ms")
+
         return outBuf
     }
 
@@ -250,7 +340,9 @@ class StormeeAudioModule: NSObject {
             player.play()
             print("▶️ Playback started")
         }
-        print("📅 Scheduled \(buf.frameLength) frames @ \(buf.format.sampleRate)Hz")
+        
+        let duration = Double(buf.frameLength) / buf.format.sampleRate * 1000.0
+        print("   📅 Scheduled: \(buf.frameLength) frames @ \(Int(buf.format.sampleRate))Hz (~\(String(format: "%.2f", duration))ms)")
     }
 
     // MARK: - WAV Test

@@ -82,7 +82,7 @@ export function AudioTest() {
 
       // Safe to send immediately after connect() resolves
       await clientRef.current?.startStreaming(
-        "Hello, please generate some audio for testing"
+        "can you tell me about devops in 200 words?"
       );
 
       addLog("📤 Query sent — waiting for audio chunks...");

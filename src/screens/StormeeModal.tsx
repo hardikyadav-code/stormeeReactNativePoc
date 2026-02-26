@@ -120,7 +120,10 @@ const StormeeModal = ({ visible, onClose }: StormeeModalProps) => {
                 {/* Thinking Indicator (Before streaming starts) */}
                 {isStormeeThinking && transcription.length === 0 && (
                   <View style={[styles.bubbleWrapper, styles.aiWrapper]}>
-                     <ActivityIndicator size="small" color="#9ca3af" style={{ margin: 10 }} />
+                    <View style={[styles.bubble, styles.aiBubble, { flexDirection: "row", alignItems: "center", gap: 8 }]}>
+                      <ActivityIndicator size="small" color="#9ca3af" />
+                      <Text style={styles.bubbleText}>Stormee is thinking...</Text>
+                    </View>
                   </View>
                 )}
               </>

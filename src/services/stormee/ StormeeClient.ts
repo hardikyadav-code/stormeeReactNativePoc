@@ -31,6 +31,7 @@ type StormeeClientRNOptions = {
   onTranscription?: (text: string) => void;
   onError?: (err: any) => void;
   onConnect?: () => void;
+  onStreamEnd?: () => void;
   onDisconnect?: () => void;
   onStateChange?: (state: WebSocketStateRN | StreamingState) => void;
   onAudioChunk?: (bytes: Uint8Array, chunkNumber?: number) => void;

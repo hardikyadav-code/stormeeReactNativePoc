@@ -14,7 +14,10 @@ export function useStormeeRN(visible: boolean) {
       sessionId: "modal-session-" + Date.now(),
       onTranscription: (text) => {
         setTranscription(text);
+      },
+      onStreamEnd: () => {
         useChatHistoryStore.getState().setIsStormeeThinking(false);
+        setTranscription(""); // Clear transcription after stream ends
       },
       onError: (err) => console.error("[useStormeeRN] Error:", err),
       onConnect: () => setConnected(true),

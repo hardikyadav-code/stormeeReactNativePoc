@@ -61,7 +61,6 @@ export class StormeeClientRN {
         this.options.onTranscription?.(text);
       },
       onAudioChunk: (bytes: Uint8Array, chunkNumber?: number) => {
-        console.log(`[StormeeClientRN] audio chunk #${chunkNumber}`);
         this.options.onAudioChunk?.(bytes, chunkNumber);
       },
       onError: (err: any) => {

@@ -1,34 +1,43 @@
 // StormeeServiceRN.ts
+// Fixed for continuous conversation lifecycle — mirrors the web StormeeService lib.
 
 import { Buffer } from "buffer";
 import { NativeModules } from "react-native";
+// 🚀 Import the Zustand Store
+import { useChatHistoryStore } from "../../store/useChatHistoryStore"; 
 
 ;(globalThis as any).Buffer = (globalThis as any).Buffer || Buffer;
 
 const { StormeeAudioModule } = NativeModules;
 
 export enum StreamingState {
-  IDLE       = "IDLE",
-  CONNECTING = "CONNECTING",
-  CONNECTED  = "CONNECTED",
-  STREAMING  = "STREAMING",
+  IDLE         = "IDLE",
+  CONNECTING   = "CONNECTING",
+  CONNECTED    = "CONNECTED",
+  STREAMING    = "STREAMING",
   RECONNECTING = "RECONNECTING",
-  ERROR      = "ERROR",
+  ERROR        = "ERROR",
 }
 
 type EventHandlers = {
-  onConnect?:        () => void;
-  onDisconnect?:     () => void;
-  onTranscription?:  (text: string, chunkNumber?: number) => void;
-  onAudioChunk?:     (bytes: Uint8Array, chunkNumber?: number) => void;
-  onError?:          (err: any) => void;
-  onStreamStart?:    () => void;
-  onStreamEnd?:      () => void;
-  onHeaderMessage?:  (message: string) => void;
-  onChunkProcessed?: (chunk: any) => void;
+  onConnect?:           () => void;
+  onDisconnect?:        () => void;
+  onTranscription?:     (text: string, chunkNumber?: number) => void;
+  onAudioChunk?:        (bytes: Uint8Array, chunkNumber?: number) => void;
+  onError?:             (err: any) => void;
+  onStreamStart?:       () => void;
+  onStreamEnd?:         () => void;
+  onHeaderMessage?:     (message: string) => void;
+  onChunkProcessed?:    (chunk: any) => void;
+  onReconnecting?:      (attempt: number) => void;
+  onReconnected?:       () => void;
+  onReconnectFailed?:   () => void;
 };
 
-// ── NEW: Robust Extractor that pulls EVERY frame from the backend array ──────
+// ── Constants ─────────────────────────────────────────────────────────────────
+const INACTIVITY_PING_INTERVAL = 10_000; // ms — ping if no data received for 10 s
+
+// ── Robust multi-frame byte extractor ────────────────────────────────────────
 function extractAllBytes(v: unknown): Uint8Array[] {
   if (v == null) return [];
 
@@ -49,7 +58,6 @@ function extractAllBytes(v: unknown): Uint8Array[] {
   if (typeof v === "object") {
     const obj = v as any;
 
-    // 1. Is it a single buffer? (Array of numbers)
     if (Array.isArray(v) && v.length > 0 && typeof v[0] === "number") {
       return [new Uint8Array(v as number[])];
     }
@@ -59,7 +67,6 @@ function extractAllBytes(v: unknown): Uint8Array[] {
       return [bytes];
     }
 
-    // 2. Is it a LIST of buffers? (Backend array of frames)
     if (Array.isArray(v)) {
       const results: Uint8Array[] = [];
       for (const el of v) results.push(...extractAllBytes(el));
@@ -71,13 +78,12 @@ function extractAllBytes(v: unknown): Uint8Array[] {
       return results;
     }
 
-    // 3. Hermes dict fallback
     const keys = Object.keys(obj).filter(k => !isNaN(Number(k))).sort((a, b) => Number(a) - Number(b));
     if (keys.length > 0) {
       if (typeof obj[keys[0]] === "number") {
-         const bytes = new Uint8Array(keys.length);
-         for (let i = 0; i < keys.length; i++) bytes[i] = obj[keys[i]] ?? 0;
-         return [bytes];
+        const bytes = new Uint8Array(keys.length);
+        for (let i = 0; i < keys.length; i++) bytes[i] = obj[keys[i]] ?? 0;
+        return [bytes];
       }
       const results: Uint8Array[] = [];
       for (let i = 0; i < keys.length; i++) results.push(...extractAllBytes(obj[keys[i]]));
@@ -89,7 +95,6 @@ function extractAllBytes(v: unknown): Uint8Array[] {
 }
 
 // ── Minimal msgpack parser ────────────────────────────────────────────────────
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 type MsgVal = any;
 interface Parsed { value: MsgVal; offset: number; }
 
@@ -97,10 +102,10 @@ function parseMsgpack(buf: Uint8Array, offset: number): Parsed {
   if (offset >= buf.length) throw new Error(`msgpack offset ${offset} out of bounds`);
   const t = buf[offset++];
 
-  if ((t & 0x80) === 0x00) return { value: t, offset };           
-  if ((t & 0xe0) === 0xe0) return { value: t - 256, offset };      
+  if ((t & 0x80) === 0x00) return { value: t, offset };
+  if ((t & 0xe0) === 0xe0) return { value: t - 256, offset };
 
-  if ((t & 0xf0) === 0x80) {                                        
+  if ((t & 0xf0) === 0x80) {
     const n = t & 0x0f;
     const map: Record<string, MsgVal> = {};
     for (let i = 0; i < n; i++) {
@@ -111,7 +116,7 @@ function parseMsgpack(buf: Uint8Array, offset: number): Parsed {
     return { value: map, offset };
   }
 
-  if ((t & 0xf0) === 0x90) {                                        
+  if ((t & 0xf0) === 0x90) {
     const n = t & 0x0f;
     const arr: MsgVal[] = [];
     for (let i = 0; i < n; i++) {
@@ -121,7 +126,7 @@ function parseMsgpack(buf: Uint8Array, offset: number): Parsed {
     return { value: arr, offset };
   }
 
-  if ((t & 0xe0) === 0xa0) {                                        
+  if ((t & 0xe0) === 0xa0) {
     const n = t & 0x1f;
     return { value: Buffer.from(buf.subarray(offset, offset + n)).toString("utf8"), offset: offset + n };
   }
@@ -130,41 +135,35 @@ function parseMsgpack(buf: Uint8Array, offset: number): Parsed {
     case 0xc0: return { value: null,  offset };
     case 0xc2: return { value: false, offset };
     case 0xc3: return { value: true,  offset };
-
     case 0xc4: { const n = buf[offset++]; return { value: buf.subarray(offset, offset + n), offset: offset + n }; }
     case 0xc5: { const n = (buf[offset] << 8) | buf[offset + 1]; offset += 2; return { value: buf.subarray(offset, offset + n), offset: offset + n }; }
     case 0xc6: { const n = ((buf[offset]<<24)|(buf[offset+1]<<16)|(buf[offset+2]<<8)|buf[offset+3])>>>0; offset+=4; return { value: buf.subarray(offset, offset + n), offset: offset + n }; }
-
     case 0xca: return { value: 0, offset: offset + 4 };
     case 0xcb: return { value: 0, offset: offset + 8 };
-
     case 0xcc: return { value: buf[offset], offset: offset + 1 };
     case 0xcd: { const v = (buf[offset]<<8)|buf[offset+1]; return { value: v, offset: offset+2 }; }
     case 0xce: { const v = ((buf[offset]<<24)|(buf[offset+1]<<16)|(buf[offset+2]<<8)|buf[offset+3])>>>0; return { value: v, offset: offset+4 }; }
     case 0xd0: { const v = buf[offset]; return { value: v > 127 ? v - 256 : v, offset: offset+1 }; }
     case 0xd1: { const v = (buf[offset]<<8)|buf[offset+1]; return { value: v > 32767 ? v - 65536 : v, offset: offset+2 }; }
     case 0xd2: { const v = (buf[offset]<<24)|(buf[offset+1]<<16)|(buf[offset+2]<<8)|buf[offset+3]; return { value: v, offset: offset+4 }; }
-
     case 0xd9: { const n = buf[offset++]; return { value: Buffer.from(buf.subarray(offset, offset+n)).toString("utf8"), offset: offset+n }; }
     case 0xda: { const n = (buf[offset]<<8)|buf[offset+1]; offset+=2; return { value: Buffer.from(buf.subarray(offset, offset+n)).toString("utf8"), offset: offset+n }; }
     case 0xdb: { const n = ((buf[offset]<<24)|(buf[offset+1]<<16)|(buf[offset+2]<<8)|buf[offset+3])>>>0; offset+=4; return { value: Buffer.from(buf.subarray(offset, offset+n)).toString("utf8"), offset: offset+n }; }
-
     case 0xdc: { const n=(buf[offset]<<8)|buf[offset+1]; offset+=2; const arr:MsgVal[]=[]; for(let i=0;i<n;i++){const v=parseMsgpack(buf,offset);offset=v.offset;arr.push(v.value);} return {value:arr,offset}; }
     case 0xde: { const n=(buf[offset]<<8)|buf[offset+1]; offset+=2; const m:Record<string,MsgVal>={}; for(let i=0;i<n;i++){const k=parseMsgpack(buf,offset);offset=k.offset;const v=parseMsgpack(buf,offset);offset=v.offset;m[String(k.value)]=v.value;} return {value:m,offset}; }
     case 0xdf: { const n=((buf[offset]<<24)|(buf[offset+1]<<16)|(buf[offset+2]<<8)|buf[offset+3])>>>0;offset+=4; const m:Record<string,MsgVal>={}; for(let i=0;i<n;i++){const k=parseMsgpack(buf,offset);offset=k.offset;const v=parseMsgpack(buf,offset);offset=v.offset;m[String(k.value)]=v.value;} return {value:m,offset}; }
-
     default: throw new Error(`Unknown msgpack type 0x${t.toString(16)} at offset ${offset-1}`);
   }
 }
 
 // ── Parse one binary WebSocket frame ─────────────────────────────────────────
 interface ChunkResult {
-  tokenId:       string;
-  opusBytesArray: Uint8Array[]; // 🚀 Now supports arrays of frames!
-  transcription: string | null;
-  chunkNumber:   number | null;
-  isEnd:         boolean;
-  headerMessage: string | null;
+  tokenId:        string;
+  opusBytesArray: Uint8Array[];
+  transcription:  string | null;
+  chunkNumber:    number | null;
+  isEnd:          boolean;
+  headerMessage:  string | null;
 }
 
 function parseFrame(raw: Uint8Array): ChunkResult {
@@ -177,7 +176,6 @@ function parseFrame(raw: Uint8Array): ChunkResult {
   try {
     const parsed = parseMsgpack(raw, 0);
     const arr = parsed.value as MsgVal[];
-
     if (!Array.isArray(arr) || arr.length < 2) return result;
 
     if (typeof arr[0] === "string") {
@@ -202,11 +200,8 @@ function parseFrame(raw: Uint8Array): ChunkResult {
     const audioRaw = meta["audio_data"];
     if (audioRaw != null) {
       const bytesArray = extractAllBytes(audioRaw);
-      if (bytesArray.length > 0) {
-        result.opusBytesArray = bytesArray;
-      }
+      if (bytesArray.length > 0) result.opusBytesArray = bytesArray;
     }
-
   } catch (err) {
     console.error("❌ parseFrame error:", err);
   }
@@ -223,23 +218,41 @@ class StormeeServiceRN {
   private handlers:  EventHandlers    = {};
   public  isConnected = false;
 
-  private reconnectAttempts   = 0;
+  // Reconnection
+  private reconnectAttempts    = 0;
   private maxReconnectAttempts = 5;
   private reconnectDelay       = 1000;
-  private pendingSessionId     = "";
   private isUserStopped        = false;
-  private chunkCounter         = 0;
 
+  // Session / query tracking
+  private pendingSessionId    = "";
+  private chunkCounter        = 0;
+  private currentResumptionToken = "";  // Last ack'd token — sent on resume
+  private lastRequestPayload: object | null = null; // Re-sent on reconnect
+  private lastRequestId       = "";     // Reused on reconnect
+
+  // Promise handles for connect()
   private connectResolve: (() => void)       | null = null;
   private connectReject:  ((e: any) => void) | null = null;
+
+  // Ordered audio playback queue (Promise chain)
   private playbackQueue: Promise<void> = Promise.resolve();
 
+  // Inactivity ping (mirrors WebSocketManager.startWaitingForResponse)
+  private inactivityTimer:          ReturnType<typeof setTimeout> | null = null;
+  private waitingForInitialResponse = false;
+
+  // 🚀 Chat Tracking
+  private currentTranscription = "";
+
   private readonly WS_BASE_URL = "wss://devllmstudio.creativeworkspace.ai/stormee-asgi-server/ws";
+
+  // ── Public API ──────────────────────────────────────────────────────────────
 
   setEventHandlers(h: EventHandlers) { this.handlers = h; }
 
   async initialize() {
-    console.log("🎵 Initializing...");
+    console.log("🎵 Initializing audio engine…");
     await StormeeAudioModule.initialize();
     console.log("✅ Audio engine ready");
   }
@@ -247,122 +260,221 @@ class StormeeServiceRN {
   getState() { return this.state; }
 
   connect(sessionId: string): Promise<void> {
-    if (this.isConnected && this.pendingSessionId === sessionId && this.socket) return Promise.resolve();
+    if (this.isConnected && this.pendingSessionId === sessionId && this.socket) {
+      return Promise.resolve();
+    }
+
     return new Promise((resolve, reject) => {
-      this.pendingSessionId = sessionId;
-      this.state            = StreamingState.CONNECTING;
-      this.connectResolve   = resolve;
-      this.connectReject    = reject;
-      this.isUserStopped    = false;
+      this.pendingSessionId  = sessionId;
+      this.state             = StreamingState.CONNECTING;
+      this.connectResolve    = resolve;
+      this.connectReject     = reject;
+      this.isUserStopped     = false;
       this.reconnectAttempts = 0;
-      this.chunkCounter     = 0;
-      this.playbackQueue    = Promise.resolve();
 
-      if (this.socket) {
-        this.socket.close();
-        this.socket = null;
-      }
+      if (this.socket) { this.socket.close(); this.socket = null; }
 
-      try {
-        const ws = new WebSocket(`${this.WS_BASE_URL}/${sessionId}`);
-        (ws as any).binaryType = "arraybuffer";
-        this.socket = ws;
-
-        ws.onopen = () => {
-          this.isConnected = true;
-          this.state       = StreamingState.CONNECTED;
-          this.reconnectAttempts = 0;
-          this.connectResolve?.();
-          this.connectResolve = this.connectReject = null;
-          this.handlers.onConnect?.();
-        };
-
-        ws.onmessage = async (e: any) => { await this.handleMessage(e); };
-
-        ws.onerror = (err: any) => {
-          this.state = StreamingState.ERROR;
-          this.connectReject?.(err);
-          this.connectResolve = this.connectReject = null;
-          this.handlers.onError?.(err);
-        };
-
-        ws.onclose = (e: any) => {
-          this.isConnected = false;
-          this.connectReject?.(new Error(`WS closed`));
-          this.connectResolve = this.connectReject = null;
-
-          if (!this.isUserStopped && this.reconnectAttempts < this.maxReconnectAttempts) {
-            this.reconnectAttempts++;
-            setTimeout(() => this.connect(this.pendingSessionId).catch(console.error), 1000);
-          } else {
-            this.state = StreamingState.IDLE;
-            this.handlers.onDisconnect?.();
-          }
-        };
-      } catch (err) {
-        this.state = StreamingState.ERROR;
-        this.connectResolve = this.connectReject = null;
-        reject(err);
-      }
+      this._openSocket();
     });
   }
 
-  disconnect() {
-    this.isUserStopped = true;
-    if (this.socket) {
-      this.socket.close();
-      this.socket = null;
+  async sendInitWithQuery(userQuery: string): Promise<void> {
+    if (!this.socket || !this.isConnected) {
+      throw new Error("Not connected — call connect() first");
     }
+
+    // ── 1. End the previous query stream (idempotent if nothing was running) ──
+    this._sendJSON({ end_current_query_stream: true });
+
+    // ── 2. Reset per-query state ──────────────────────────────────────────────
+    this.isUserStopped         = false;
+    this.chunkCounter          = 0;
+    this.playbackQueue         = Promise.resolve();
+    this.waitingForInitialResponse = false;
+    this.clearInactivityTimer();
+
+    // 🚀 Reset UI Transcription State
+    this.currentTranscription = ""; 
+    this.handlers.onTranscription?.("", 0);
+
+    // Reset audio module for a clean slate
+    try { await StormeeAudioModule.resetForNewQuery?.(); } catch (_) {}
+
+    // ── 3. Build payload ───────────────────────────────────────────────────────
+    const isResume       = !!this.currentResumptionToken;
+    const requestId      = isResume && this.lastRequestId
+      ? this.lastRequestId
+      : `requestId-${this._uuid()}`;
+    this.lastRequestId   = requestId;
+
+    // 🚀 Grab current conversation history from Zustand
+    const currentHistory = useChatHistoryStore.getState().chatHistory;
+
+    const payload = {
+      concierge_name: "stormee",
+      request_id:     requestId,
+      agent_arguments: { user_query: userQuery },
+      
+      // 🚀 Inject history
+      chat_history:   currentHistory, 
+      
+      metadata: JSON.stringify({
+        // 🚀 Inject history into metadata
+        chat_history: currentHistory, 
+        rlef_id: "", mode_parameters: {}, mongo_db_id: "",
+        template_name:   "open_brainstorming", context: "",
+        user_id:         "68fbb9ec1fff8606d6b61b93",
+        project_id:      "69948177cb0b34761aa56e0e",
+        delay_on_initial_message: 0,
+        query_number:    "-1",
+        userEmailId:     "vikas.as@techolution.com",
+        userName:        "Vikas A S",
+        modeName:        "BrainStorm Mode",
+      }),
+      session_id:       this.pendingSessionId,
+      query_number:     "-1",
+      resumption_token: this.currentResumptionToken, 
+    };
+
+    this.lastRequestPayload    = payload as any;
+    this.currentResumptionToken = "";
+
+    this.state = StreamingState.STREAMING;
+    this._sendJSON(payload);
+
+    this.waitingForInitialResponse = true;
+    this.startInactivityTimer();
+    this.handlers.onStreamStart?.();
+  }
+
+  stopStreaming(): void {
+    this.isUserStopped              = true;
+    this.waitingForInitialResponse  = false;
+    this.clearInactivityTimer();
+    this.currentResumptionToken     = "";
+    this.lastRequestPayload         = null;
+    this.lastRequestId              = "";
+
+    this._sendJSON({ end_current_query_stream: true });
+
+    this.state = StreamingState.CONNECTED;
+    this.handlers.onStreamEnd?.();
+
+    try { StormeeAudioModule.stopPlayback?.(); } catch (_) {}
+    this.playbackQueue = Promise.resolve();
+  }
+
+  disconnect(): void {
+    this.isUserStopped = true;
+    this.waitingForInitialResponse = false;
+    this.clearInactivityTimer();
+    if (this.socket) { this.socket.close(); this.socket = null; }
     this.isConnected = false;
     this.state       = StreamingState.IDLE;
     this.handlers.onDisconnect?.();
   }
 
-  sendInitWithQuery(userQuery: string) {
-    if (!this.socket || !this.isConnected) return;
+  async playWAVFile() { return StormeeAudioModule.playWAVFile(); }
 
-    this.state         = StreamingState.STREAMING;
-    this.isUserStopped = false;
-    this.chunkCounter  = 0;
-    this.playbackQueue = Promise.resolve();
+  private startInactivityTimer(): void {
+    this.clearInactivityTimer();
+    this.inactivityTimer = setTimeout(() => {
+      if (this.isConnected && this.waitingForInitialResponse) {
+        console.log("📡 No data for 10 s — sending ping");
+        this._sendJSON({ ping: true });
+        this.startInactivityTimer(); 
+      }
+    }, INACTIVITY_PING_INTERVAL);
+  }
 
-    const payload = {
-      concierge_name: "stormee",
-      request_id:     `requestId-${this.generateUUID()}`,
-      agent_arguments: { user_query: userQuery },
-      chat_history:   [],
-      metadata: JSON.stringify({
-        chat_history: [], rlef_id: "", mode_parameters: {}, mongo_db_id: "",
-        template_name: "open_brainstorming", context: "",
-        user_id:      "68fbb9ec1fff8606d6b61b93",
-        project_id:   "69948177cb0b34761aa56e0e",
-        delay_on_initial_message: 0,
-        query_number: "-1",
-        userEmailId:  "vikas.as@techolution.com",
-        userName:     "Vikas A S",
-        modeName:     "BrainStorm Mode",
-      }),
-      session_id:       this.generateUUID(),
-      query_number:     "-1",
-      resumption_token: "",
-    };
+  private clearInactivityTimer(): void {
+    if (this.inactivityTimer) {
+      clearTimeout(this.inactivityTimer);
+      this.inactivityTimer = null;
+    }
+  }
 
+  private _openSocket(): void {
     try {
-      this.socket.send(JSON.stringify(payload));
+      const ws = new WebSocket(`${this.WS_BASE_URL}/${this.pendingSessionId}`);
+      (ws as any).binaryType = "arraybuffer";
+      this.socket = ws;
+
+      ws.onopen = () => {
+        this.isConnected      = true;
+        this.state            = StreamingState.CONNECTED;
+        this.reconnectAttempts = 0;
+        this.connectResolve?.();
+        this.connectResolve = this.connectReject = null;
+        this.handlers.onConnect?.();
+
+        if (this.lastRequestPayload && !this.isUserStopped) {
+          this._resumeAfterReconnect();
+        }
+      };
+
+      ws.onmessage = async (e: any) => { await this._handleMessage(e); };
+
+      ws.onerror = (err: any) => {
+        this.state = StreamingState.ERROR;
+        this.connectReject?.(err);
+        this.connectResolve = this.connectReject = null;
+        this.handlers.onError?.(err);
+      };
+
+      ws.onclose = (_e: any) => {
+        this.isConnected = false;
+        this.connectReject?.(new Error("WS closed"));
+        this.connectResolve = this.connectReject = null;
+        this.clearInactivityTimer();
+
+        if (!this.isUserStopped && this.reconnectAttempts < this.maxReconnectAttempts) {
+          this.reconnectAttempts++;
+          this.state = StreamingState.RECONNECTING;
+          this.handlers.onReconnecting?.(this.reconnectAttempts);
+          setTimeout(() => this._openSocket(), this.reconnectDelay);
+        } else if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+          this.state = StreamingState.IDLE;
+          this.handlers.onReconnectFailed?.();
+        } else {
+          this.state = StreamingState.IDLE;
+          this.handlers.onDisconnect?.();
+        }
+      };
     } catch (err) {
       this.state = StreamingState.ERROR;
+      this.connectResolve = this.connectReject = null;
       this.handlers.onError?.(err);
     }
   }
 
-  private sendAck(tokenId: string) {
-    if (!this.socket || !this.isConnected || !tokenId) return;
-    try { this.socket.send(JSON.stringify({ ack: tokenId })); } catch (err) {}
+  private _resumeAfterReconnect(): void {
+    if (!this.lastRequestPayload) return;
+
+    const payload = {
+      ...(this.lastRequestPayload as any),
+      request_id:      this.lastRequestId,
+      resumption_token: this.currentResumptionToken,
+    };
+
+    console.log("🔄 Resuming stream after reconnect, token:", this.currentResumptionToken || "(none)");
+
+    this.chunkCounter  = 0;
+    this.playbackQueue = Promise.resolve();
+    this.state         = StreamingState.STREAMING;
+    this.isUserStopped = false;
+
+    this._sendJSON(payload);
+
+    this.waitingForInitialResponse = true;
+    this.startInactivityTimer();
+
+    this.handlers.onReconnected?.();
   }
 
-  private async handleMessage(event: any) {
+  private async _handleMessage(event: any): Promise<void> {
     if (!event.data) return;
-    
+
     try {
       if (event.data instanceof ArrayBuffer) {
         if (this.isUserStopped) return;
@@ -370,72 +482,96 @@ class StormeeServiceRN {
         const payload = new Uint8Array(event.data);
         if (payload.length === 0) return;
 
+        this._resetInactivityTimer();
+
+        let parsed: ReturnType<typeof parseMsgpack>;
         try {
-          const parsed = parseMsgpack(payload, 0);
-          const tokenId = parsed.value[0];
-          const chunkObject = parsed.value[1];
-
-          if (chunkObject) {
-            this.chunkCounter++;
-
-            if (tokenId) {
-                const tokenStr = typeof tokenId === "string" ? tokenId : Buffer.from(tokenId).toString("utf8");
-                this.sendAck(tokenStr);
-            }
-
-            if (chunkObject.transcription) {
-              const tx = chunkObject.transcription;
-              if (!tx.startsWith("{") && !tx.includes("<cognitive")) {
-                this.handlers.onTranscription?.(tx, this.chunkCounter);
-              }
-            }
-
-            // 🚀 THE FIX: Loop through ALL frames in the array and process them!
-            if (chunkObject.audio_data) {
-              const frames = extractAllBytes(chunkObject.audio_data);
-              
-              if (frames.length > 0) {
-                 console.log(`📦 Unpacked ${frames.length} Opus frames from chunk #${this.chunkCounter}!`);
-                 for (const frame of frames) {
-                    await this.processPureAudioFrame(frame);
-                 }
-              }
-            }
-
-            if (chunkObject.isEnd) {
-              this.playbackQueue = this.playbackQueue.then(async () => {
-                try {
-                  await StormeeAudioModule.processAccumulatedAudio();
-                } catch (err) {}
-              });
-              this.handlers.onStreamEnd?.();
-            }
-          }
-        } catch (unpackError) {
-          console.error("🚨 Failed to unpack MessagePack:", unpackError);
+          parsed = parseMsgpack(payload, 0);
+        } catch (e) {
+          console.error("🚨 Failed to unpack MessagePack:", e);
+          return;
         }
 
+        const tokenId    = parsed.value[0];
+        const chunkObject = parsed.value[1];
+        if (!chunkObject) return;
+
+        this.chunkCounter++;
+
+        if (tokenId) {
+          const tokenStr = typeof tokenId === "string"
+            ? tokenId
+            : Buffer.from(tokenId).toString("utf8");
+          this.currentResumptionToken = tokenStr;
+          this._sendAck(tokenStr);
+        }
+
+        // Transcription
+        if (chunkObject.transcription) {
+          const tx: string = chunkObject.transcription;
+          if (!tx.startsWith("{") && !tx.includes("<cognitive")) {
+            this.currentTranscription = tx; // 🚀 Keep track of the transcription string
+            this.handlers.onTranscription?.(tx, this.chunkCounter);
+          }
+        }
+
+        if (chunkObject.header_message) {
+          this.handlers.onHeaderMessage?.(chunkObject.header_message);
+        }
+
+        // Audio frames
+        if (chunkObject.audio_data) {
+          const frames = extractAllBytes(chunkObject.audio_data);
+          if (frames.length > 0) {
+            console.log(`📦 ${frames.length} Opus frame(s) in chunk #${this.chunkCounter}`);
+            for (const frame of frames) {
+              await this._enqueueAudioFrame(frame);
+            }
+          }
+        }
+
+        // Stream end
+        if (chunkObject.isEnd) {
+          
+          // 🚀 1. Push final transcription to Zustand store
+          if (this.currentTranscription.trim().length > 0) {
+            useChatHistoryStore.getState().addAssistantMessage(this.currentTranscription.trim());
+          }
+          
+          // 🚀 2. Unlock the UI input
+          useChatHistoryStore.getState().setIsStormeeThinking(false);
+
+          this.playbackQueue = this.playbackQueue.then(async () => {
+            try { await StormeeAudioModule.processAccumulatedAudio(); } catch (_) {}
+          });
+
+          this.playbackQueue = this.playbackQueue.then(() => {
+            this.state                     = StreamingState.CONNECTED;
+            this.waitingForInitialResponse = false;
+            this.clearInactivityTimer();
+            this.lastRequestPayload        = null;
+            this.lastRequestId             = "";
+            this.currentResumptionToken    = "";
+            this._sendJSON({ end_current_query_stream: true });
+            this.handlers.onStreamEnd?.();
+          });
+        }
+
+        this.handlers.onChunkProcessed?.(chunkObject);
+
       } else if (typeof event.data === "string") {
-        try { await this.processJSON(JSON.parse(event.data)); } catch {}
+        this._resetInactivityTimer();
+        let data: any;
+        try { data = JSON.parse(event.data); } catch { return; }
+        if (data.ack) return;
+        await this._processJSON(data);
       }
     } catch (err) {
       this.handlers.onError?.(err);
     }
   }
 
-  private async processPureAudioFrame(opusBytes: Uint8Array) {
-    const b64 = Buffer.from(opusBytes).toString("base64");
-    this.playbackQueue = this.playbackQueue.then(async () => {
-      try {
-        await StormeeAudioModule.writeAudioFrame(b64);
-      } catch (err) {}
-    });
-    this.handlers.onAudioChunk?.(opusBytes, this.chunkCounter);
-  }
-
-  private async processJSON(data: any) {
-    if (data.ack) return; 
-
+  private async _processJSON(data: any): Promise<void> {
     switch (data.type) {
       case "stream_started":
         this.chunkCounter  = 0;
@@ -454,9 +590,31 @@ class StormeeServiceRN {
     }
   }
 
-  async playWAVFile() { return StormeeAudioModule.playWAVFile(); }
+  private async _enqueueAudioFrame(opusBytes: Uint8Array): Promise<void> {
+    const b64 = Buffer.from(opusBytes).toString("base64");
+    this.playbackQueue = this.playbackQueue.then(async () => {
+      try { await StormeeAudioModule.writeAudioFrame(b64); } catch (_) {}
+    });
+    this.handlers.onAudioChunk?.(opusBytes, this.chunkCounter);
+  }
 
-  private generateUUID() {
+  private _sendAck(tokenId: string): void {
+    if (!tokenId) return;
+    this._sendJSON({ ack: tokenId });
+  }
+
+  private _sendJSON(obj: object): void {
+    if (!this.socket || !this.isConnected) return;
+    try { this.socket.send(JSON.stringify(obj)); } catch (_) {}
+  }
+
+  private _resetInactivityTimer(): void {
+    if (this.waitingForInitialResponse) {
+      this.startInactivityTimer(); 
+    }
+  }
+
+  private _uuid(): string {
     return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
       const r = (Math.random() * 16) | 0;
       return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);

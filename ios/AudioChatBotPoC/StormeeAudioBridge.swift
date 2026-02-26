@@ -95,7 +95,6 @@ class StormeeAudioModule: NSObject {
         self.opusChunks.append(opusData)
         self.accumulatedChunkCount += 1
         
-        print("📦 [ACCUMULATED] Chunk #\(self.accumulatedChunkCount) added to array")
         resolve("accumulated")
     }
 
